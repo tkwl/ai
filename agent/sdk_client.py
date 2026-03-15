@@ -705,6 +705,9 @@ class ValorAgent:
             hooks=build_hooks_config(),
             agents=get_agent_definitions(),
             max_budget_usd=self.max_budget_usd,
+            model="claude-opus-4-5-20251101",
+            effort="max",
+            betas=["context-1m-2025-08-07"],
         )
 
     async def query(self, message: str, session_id: str | None = None, max_retries: int = 2) -> str:
