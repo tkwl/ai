@@ -124,8 +124,8 @@ The observer telemetry check is included in `get_overall_health()` alongside dat
 | File | Role |
 |------|------|
 | `monitoring/telemetry.py` | Core telemetry module: record functions, get_summary, check_observer_health |
-| `bridge/observer.py` | Calls record_decision, record_interjection, record_tool_use |
-| `bridge/stage_detector.py` | Calls record_stage_transition on each applied transition |
+| `agent/job_queue.py` | Calls record_decision for nudge loop routing |
+| `bridge/pipeline_state.py` | State machine logs stage transitions |
 | `models/agent_session.py` | Structured LINK logging in set_link() |
 | `monitoring/health.py` | check_observer_telemetry() integrated into overall health |
 | `tests/test_telemetry.py` | Unit tests for all telemetry functions and integrations |

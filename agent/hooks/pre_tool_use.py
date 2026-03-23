@@ -1,13 +1,21 @@
-"""PreToolUse hook: blocks writes to sensitive files."""
+"""PreToolUse hook: blocks sensitive writes, enforces PM restrictions, registers DevSessions."""
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from claude_agent_sdk import HookContext, PreToolUseHookInput
 
 logger = logging.getLogger(__name__)
+
+# Paths the PM (ChatSession) is allowed to write to.
+# Everything else is blocked for PM sessions.
+PM_ALLOWED_WRITE_PREFIXES = (
+    "docs/",
+    "/docs/",
+)
 
 # Files that should never be written to by the agent
 SENSITIVE_PATHS = frozenset(
@@ -28,6 +36,26 @@ SENSITIVE_FRAGMENTS = (
     "/.ssh/",
     "/private_key",
 )
+
+
+def _is_pm_session() -> bool:
+    """Check if the current session is a PM (ChatSession)."""
+    return os.environ.get("SESSION_TYPE") == "chat"
+
+
+def _is_pm_allowed_write(file_path: str) -> bool:
+    """Check if the PM is allowed to write to this path.
+
+    PM sessions can only write to docs/ directories.
+    """
+    if not file_path:
+        return False
+    normalized = file_path.replace("\\", "/")
+    # Check against allowed prefixes (relative and absolute)
+    for prefix in PM_ALLOWED_WRITE_PREFIXES:
+        if prefix in normalized:
+            return True
+    return False
 
 
 def _is_sensitive_path(file_path: str) -> bool:
@@ -51,18 +79,59 @@ def _is_sensitive_path(file_path: str) -> bool:
     return False
 
 
+def _maybe_register_dev_session(tool_input: dict[str, Any]) -> None:
+    """Register a DevSession in Redis when the Agent tool spawns a dev-session.
+
+    Reads VALOR_SESSION_ID from env to find the parent ChatSession.
+    Creates an AgentSession record with session_type=dev and parent linkage.
+    """
+    import os
+
+    from models.agent_session import AgentSession
+
+    subagent_type = tool_input.get("type", "")
+    if subagent_type != "dev-session":
+        return
+
+    parent_session_id = os.environ.get("VALOR_SESSION_ID")
+    if not parent_session_id:
+        logger.debug("[pre_tool_use] VALOR_SESSION_ID not set, skipping DevSession registration")
+        return
+
+    try:
+        prompt_text = tool_input.get("prompt", "")[:200] or "dev-session"
+        dev_session = AgentSession.create_dev(
+            session_id=f"dev-{parent_session_id}",
+            project_key="default",
+            working_dir=os.getcwd(),
+            parent_chat_session_id=parent_session_id,
+            message_text=prompt_text,
+        )
+        logger.info(
+            f"[pre_tool_use] Registered DevSession {dev_session.job_id} parent={parent_session_id}"
+        )
+    except Exception as e:
+        logger.warning(f"[pre_tool_use] Failed to register DevSession: {e}")
+
+
 async def pre_tool_use_hook(
     input_data: PreToolUseHookInput,
     tool_use_id: str | None,
     context: HookContext,
 ) -> dict[str, Any]:
-    """Block writes to sensitive files like .env and credentials.json.
+    """Block writes to sensitive files and register DevSessions on Agent tool calls.
 
     Inspects Write and Edit tool calls for sensitive file paths
-    and blocks them before execution.
+    and blocks them before execution. Also detects when the Agent tool
+    spawns a dev-session and registers it in Redis with parent linkage.
     """
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
+
+    # Detect Agent tool spawning a dev-session
+    if tool_name == "Agent":
+        _maybe_register_dev_session(tool_input)
+        return {}
 
     # Only inspect write-capable tools
     if tool_name not in ("Write", "Edit", "Bash"):
@@ -78,6 +147,17 @@ async def pre_tool_use_hook(
                 "reason": (
                     f"Blocked: writing to sensitive file '{file_path}' is not allowed. "
                     "Sensitive files (.env, credentials, secrets) must be managed manually."
+                ),
+            }
+        # PM sessions can only write to docs/
+        if _is_pm_session() and not _is_pm_allowed_write(file_path):
+            logger.warning(f"[pre_tool_use] PM blocked from writing to: {file_path}")
+            return {
+                "decision": "block",
+                "reason": (
+                    f"Blocked: PM session cannot write to '{file_path}'. "
+                    "PM can only write to docs/ directories. "
+                    "Spawn a dev-session subagent for code changes."
                 ),
             }
 

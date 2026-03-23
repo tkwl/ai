@@ -21,19 +21,19 @@ Unified Redis model tracking agent work from enqueue through completion. Replace
 `append_history(role, text)` records lifecycle events capped at 20 entries. When truncation occurs, a `WARNING`-level log is emitted with the original length and number of dropped entries:
 - `[user]` - Original request
 - `[classify]` - Auto-classification result
-- `[stage]` - SDLC stage transitions (e.g., `BUILD ☑`)
 - `[summary]` - Session summary notes
 
-## SDLC Stage Helpers
+## SDLC Stage Tracking
 
-Methods for querying pipeline state from history:
+Pipeline stage state is stored in the `stage_states` JSON field on AgentSession, managed by the `PipelineStateMachine` in `bridge/pipeline_state.py`. The state machine provides:
 
 | Method | Returns | Purpose |
 |---|---|---|
-| `is_sdlc_job()` | `bool` | `True` if `classification_type == "sdlc"` OR history contains `[stage]` entries |
-| `has_remaining_stages()` | `bool` | `True` if any SDLC stage is `pending` or `in_progress` |
-| `has_failed_stage()` | `bool` | `True` if any stage has `FAILED` or `ERROR` status |
-| `get_stage_progress()` | `dict` | Maps stage names to status (`completed`, `in_progress`, `pending`, `failed`) |
+| `PipelineStateMachine.has_remaining_stages()` | `bool` | `True` if pipeline graph has a non-terminal next stage from the last completed stage |
+| `PipelineStateMachine.has_failed_stage()` | `bool` | `True` if any stage has `FAILED` or `ERROR` status |
+| `PipelineStateMachine.get_display_progress()` | `dict` | Maps stage names to status (`completed`, `in_progress`, `pending`, `failed`) |
+
+`is_sdlc` (property) returns `True` if `classification_type == "sdlc"`.
 
 These are used by the [stage-aware auto-continue](bridge-workflow-gaps.md#stage-aware-path-sdlc-jobs) routing in `agent/job_queue.py`.
 
@@ -41,18 +41,9 @@ These are used by the [stage-aware auto-continue](bridge-workflow-gaps.md#stage-
 
 `set_link(kind, url)` stores issue, plan, and PR URLs as each SDLC stage completes. `get_links()` returns all tracked links.
 
-## CLI Tool
+## Stage Tracking
 
-`tools/session_progress.py` updates stage progress and links from Bash:
-
-```bash
-python -m tools.session_progress --session-id $ID --stage BUILD --status completed
-python -m tools.session_progress --session-id $ID --pr-url https://github.com/.../pull/42
-```
-
-### SDLC Skill Wiring
-
-Each SDLC skill calls `session_progress.py` to record stage transitions. The SESSION_ID is extracted from the `SESSION_ID: xxx` line injected by `sdk_client.py` into enriched messages.
+Stage transitions are managed by the `PipelineStateMachine` in `bridge/pipeline_state.py`. Stage status is set programmatically at transition points (`start_stage()`, `complete_stage()`, `fail_stage()`) rather than via a CLI tool.
 
 | Skill | Stage | Transitions | Links Set |
 |-------|-------|-------------|-----------|
@@ -62,8 +53,6 @@ Each SDLC skill calls `session_progress.py` to record stage transitions. The SES
 | `/do-test` | TEST | `in_progress` → `completed` or `failed` | — |
 | `/do-pr-review` | REVIEW | `in_progress` → `completed` | — |
 | `/do-docs` | DOCS | `in_progress` → `completed` | — |
-
-All calls use `2>/dev/null || true` for fire-and-forget behavior — stage tracking failures never block pipeline work.
 
 ### Session Lookup Chain
 
@@ -121,7 +110,7 @@ Each `session_id` has exactly one `AgentSession` at any time. The `AgentSession`
 
 Only four fields change during continuation: `status` (reset to "pending"), `message_text` (coaching message), `auto_continue_count` (incremented), and `priority` (set to "high").
 
-**Fresh reads in routing:** The `send_to_chat` closure in `_execute_job()` re-reads the `AgentSession` from Redis before making routing decisions. This ensures `is_sdlc_job()`, `has_remaining_stages()`, and `has_failed_stage()` evaluate data written by `session_progress.py` in the agent subprocess, not the stale in-memory copy captured at job start.
+**Fresh reads in routing:** The `send_to_chat` closure in `_execute_job()` re-reads the `AgentSession` from Redis before making routing decisions. This ensures `is_sdlc` and `stage_states` data are current, not the stale in-memory copy captured at job start.
 
 ### Field Preservation on Status Change
 

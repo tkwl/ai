@@ -32,6 +32,21 @@ If nothing found, state "No prior issues found related to this work."]
 - **[Issue/PR #N]**: [Title] -- [What it did, outcome, relevance to current work]
 - **[Issue/PR #N]**: [Title] -- [What it did, outcome, relevance to current work]
 
+## Spike Results
+
+<!-- CONDITIONAL: Only include if Phase 1.5 ran spike tasks to validate assumptions.
+     Delete this section if no spikes were needed (e.g., Small appetite greenfield work).
+     Spike results provide validated findings so builders don't re-investigate assumptions. -->
+
+[Results from time-boxed spike investigations that validated or invalidated plan assumptions.]
+
+### spike-1: [Description]
+- **Assumption**: "[What was being tested]"
+- **Method**: [web-research | prototype | code-read]
+- **Finding**: [What was discovered]
+- **Confidence**: [high | medium | low]
+- **Impact on plan**: [How this finding shaped the solution]
+
 ## Data Flow
 
 <!-- Trace the end-to-end data flow through the components this change touches.
@@ -144,6 +159,18 @@ Settings page → Click "Enable 2FA" → Setup screen → Enter code → Confirm
 ### Error State Rendering
 - [ ] If the feature has user-visible output, test the error/failure rendering path (not just success)
 - [ ] Verify error messages propagate to the user rather than being swallowed silently
+
+## Test Impact
+
+[Audit existing tests that will break or need changes due to this work. For each affected test file or test case, specify a disposition: UPDATE, DELETE, or REPLACE. This gives builders clear guidance on test modifications before they start implementation.]
+
+- [ ] `tests/unit/test_example.py::test_old_behavior` — UPDATE: assert new return value instead of old
+- [ ] `tests/integration/test_flow.py::test_end_to_end` — REPLACE: rewrite for new API contract
+- [ ] `tests/unit/test_legacy.py::test_deprecated_path` — DELETE: tests removed feature
+
+[If no existing tests are affected, state that explicitly with justification:]
+
+No existing tests affected — [justification explaining why, e.g., "this is a greenfield feature with no prior test coverage" or "changes are purely additive and don't modify any existing behavior or interfaces"].
 
 ## Rabbit Holes
 
@@ -293,6 +320,8 @@ When this plan is executed, the lead agent orchestrates work using Task tools. T
 ### 1. [First Build Task]
 - **Task ID**: build-[component]
 - **Depends On**: none
+- **Validates**: [test files/patterns that must pass, e.g., tests/unit/test_component.py, tests/integration/test_bar.py (create)]
+- **Informed By**: [spike task IDs with key findings, e.g., spike-1 (confirmed: API supports batch calls)]
 - **Assigned To**: [builder name from Team Members]
 - **Agent Type**: [agent type]
 - **Parallel**: true
@@ -344,6 +373,11 @@ Supported expectations: "exit code N", "output > N", "output contains X".]
 | Format clean | `python -m ruff format --check .` | exit code 0 |
 | No stale xfails | `grep -rn 'xfail' tests/ \| grep -v '# open bug'` | exit code 1 |
 | [Feature-specific check] | `[command]` | [expected] |
+
+## Critique Results
+
+<!-- Populated by /do-plan-critique (war room). Leave empty until critique is run. -->
+| CONCERN | [agent-type] | [The concern raised] | [How/whether it was addressed] |
 
 ---
 

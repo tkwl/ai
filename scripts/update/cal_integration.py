@@ -175,7 +175,7 @@ def ensure_global_hook(project_dir: Path) -> CalendarHookResult:
 
 def generate_calendar_config(project_dir: Path) -> CalendarConfigResult:
     """Generate Google Calendar config by matching projects to calendars."""
-    base_dir = Path.home() / "Desktop" / "claude_code"
+    base_dir = Path.home() / "Desktop" / "Valor"
     config_path = base_dir / "calendar_config.json"
     token_path = base_dir / "google_token.json"
 
@@ -256,6 +256,7 @@ def generate_calendar_config(project_dir: Path) -> CalendarConfigResult:
     from dotenv import load_dotenv
 
     load_dotenv(project_dir / ".env")
+    load_dotenv(Path.home() / "Desktop" / "Valor" / ".env")
     active_projects = [p.strip() for p in os.getenv("ACTIVE_PROJECTS", "").split(",") if p.strip()]
 
     # Match each project to a calendar

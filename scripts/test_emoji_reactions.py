@@ -26,10 +26,11 @@ from telethon.tl.types import ReactionEmoji
 
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(env_path)
+load_dotenv(Path.home() / "Desktop" / "Valor" / ".env")
 
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "ai_rebuild_session")
+SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "valor_bridge")
 SESSION_PATH = Path(__file__).parent.parent / "data" / SESSION_NAME
 
 # Tom's user ID from the logs

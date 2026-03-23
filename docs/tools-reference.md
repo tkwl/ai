@@ -6,14 +6,10 @@ Complete documentation of all tools available in the Valor system.
 
 Individual operations that can be composed into larger workflows:
 
-| Tool | Purpose | Location |
-|------|---------|----------|
-| **Stripe** | Payment processing, subscriptions, billing | `~/clawd/skills/stripe/` |
-| **Sentry** | Error monitoring, performance analysis | `~/clawd/skills/sentry/` |
-| **GitHub** | Repository operations, PRs, issues | `~/clawd/skills/github/` |
-| **Render** | Deployment, infrastructure management | `~/clawd/skills/render/` |
-| **Notion** | Knowledge base, documentation | `~/clawd/skills/notion/` |
-| **Linear** | Project management, issue tracking | `~/clawd/skills/linear/` |
+| Tool | Purpose | Configuration |
+|------|---------|---------------|
+| **Sentry** | Error monitoring, performance analysis | `.mcp.json` |
+| **GitHub** | Repository operations, PRs, issues | `gh` CLI (pre-authenticated) |
 
 ## Local Python Tools
 
@@ -267,4 +263,4 @@ See `/add-feature` skill for how to create new tools.
 ## See Also
 
 - Run `/add-feature` for creating new tools
-- Check `~/clawd/skills/` for MCP skill implementations
+- Check `.claude/skills/` for skill implementations

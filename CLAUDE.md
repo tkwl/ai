@@ -6,7 +6,7 @@ Guidance for Claude Code when working with this repository.
 
 ## Google Workspace CLI (`gws`)
 
-Available at `/Users/valorengels/src/node_modules/.bin/gws`. Pre-authenticated.
+Available at `~/src/node_modules/.bin/gws`. Pre-authenticated.
 
 Usage: `gws <service> <resource> [sub-resource] <method> [flags]`
 
@@ -32,6 +32,33 @@ gws sheets spreadsheets values get --params '{"spreadsheetId": "ID", "range": "S
 
 **Workflows:** `gws workflow +standup-report`, `+meeting-prep`, `+email-to-task`, `+weekly-digest`
 
+## Reading Telegram Messages
+
+Use Telethon directly to read messages from any chat. The bridge session file provides access.
+
+```python
+python -c "
+import asyncio
+from telethon import TelegramClient
+from dotenv import load_dotenv
+import os
+load_dotenv()
+client = TelegramClient('data/valor_bridge', int(os.getenv('TELEGRAM_API_ID')), os.getenv('TELEGRAM_API_HASH'))
+async def main():
+    await client.start(phone=os.getenv('TELEGRAM_PHONE'))
+    async for d in client.iter_dialogs():
+        if 'CHAT_NAME' in (d.name or ''):
+            for m in reversed(await client.get_messages(d.id, limit=10)):
+                sender = 'Valor' if m.out else (getattr(m.sender, 'first_name', None) or 'Unknown')
+                print(f'[{m.date}] {sender}: {(m.text or \"\")[:300]}')
+            break
+    await client.disconnect()
+asyncio.run(main())
+"
+```
+
+Replace `CHAT_NAME` with the group name (e.g. `PM: PsyOptimal`, `Dev: Valor`). This reads real messages from Telegram — the CLI history tool (`valor-history`) only shows messages stored in Redis, which may be incomplete.
+
 ## Quick Commands
 
 | Command | Description |
@@ -41,12 +68,23 @@ gws sheets spreadsheets values get --params '{"spreadsheetId": "ID", "range": "S
 | `./scripts/valor-service.sh restart` | Restart after code changes |
 | `tail -f logs/bridge.log` | Stream bridge logs |
 | `pytest tests/` | Run all tests |
+| `pytest tests/unit/` | Run unit tests only (fast, ~60s) |
+| `pytest tests/unit/ -n auto` | Run unit tests in parallel |
+| `pytest tests/integration/` | Run integration tests only |
+| `pytest -m sdlc` | Run tests for a specific feature (see `tests/README.md`) |
 | `python -m ruff format . && python -m ruff check .` | Format and lint |
 | `python scripts/reflections.py` | Run reflections maintenance manually |
 | `python scripts/reflections.py --dry-run` | Test reflections without side effects |
 | `python scripts/reflections.py --ignore "pattern"` | Silence a bug pattern for 14 days |
 | `./scripts/install_reflections.sh` | Install reflections launchd schedule |
 | `tail -f logs/reflections.log` | Stream reflections logs |
+| `python scripts/issue_poller.py` | Run issue poller manually (polls GitHub for new issues) |
+| `./scripts/install_issue_poller.sh` | Install issue poller launchd schedule (5-min interval) |
+| `tail -f logs/issue_poller.log` | Stream issue poller logs |
+| `python scripts/autoexperiment.py --target observer --iterations 50` | Run autoexperiment on observer prompt |
+| `python scripts/autoexperiment.py --target summarizer --dry-run` | Dry-run autoexperiment on summarizer |
+| `python scripts/autoexperiment.py --list-targets` | List autoexperiment targets |
+| `./scripts/install_autoexperiment.sh` | Install autoexperiment nightly schedule |
 
 ## Development Principles
 
@@ -87,9 +125,10 @@ gws sheets spreadsheets values get --params '{"spreadsheetId": "ID", "range": "S
 - Do NOT parallelize sequential/dependent work
 - Always aggregate results before reporting
 
-### 9. SDLC IS OBSERVER-STEERED
+### 9. SDLC PIPELINE
+- ChatSession (PM persona) orchestrates; DevSession (Dev persona) executes
+- Bridge uses nudge loop for output routing (no SDLC awareness in bridge)
 - `/sdlc` is a **single-stage router**: it assesses state, invokes ONE sub-skill, and returns
-- The **Observer Agent** handles pipeline progression by re-invoking `/sdlc` after each stage completes
 - NEVER write code, run tests, or create plans directly -- always delegate through sub-skills
 - See `.claude/skills/sdlc/SKILL.md` for the ground truth on pipeline stages
 
@@ -109,7 +148,7 @@ The standard flow from conversation to shipped feature:
 - If it's a real piece of work: create a GitHub issue
 
 ### Phase 2: SDLC (triggered by work request)
-- The Observer Agent steers the pipeline by invoking `/sdlc` one stage at a time
+- ChatSession steers the pipeline, invoking `/sdlc` skills as needed
 - `/sdlc` assesses current state, invokes ONE sub-skill, and returns
 - Stages: Plan -> Build -> Test -> Patch -> Review -> Patch -> Docs -> Merge
 - See `.claude/skills/sdlc/SKILL.md` for the ground truth on stage definitions
@@ -123,8 +162,9 @@ The standard flow from conversation to shipped feature:
 - If there is no question -- just a status update -- the summarizer auto-sends "continue"
 - Status updates without questions or signs of completion are NOT stopping points
 - The agent keeps working until the phase is complete or it's genuinely blocked
-- **SDLC jobs**: The Observer Agent steers pipeline progression by re-invoking `/sdlc` after each stage
-- **Non-SDLC jobs** use classifier-based routing with `MAX_AUTO_CONTINUES = 3`
+- **SDLC jobs**: ChatSession steers pipeline progression between stages
+- **ChatSession** orchestrates DevSession work; all messages route through ChatSession
+- Auto-continue caps are set to 50 as safety backstops (ChatSession manages actual routing)
 - The auto-continue counter resets when the human sends a new message
 
 ### Session Continuity
@@ -135,14 +175,22 @@ The standard flow from conversation to shipped feature:
 ## System Architecture
 
 ```
-Telegram → Python Bridge (Telethon) → Claude Agent SDK → Claude API
-              (bridge/telegram_bridge.py)    (agent/sdk_client.py)
+Telegram → Python Bridge (Telethon) → ChatSession (read-only, PM persona)
+              (bridge/telegram_bridge.py)     → Nudge loop (bridge has no SDLC awareness)
+                                              → Spawns DevSession (full permissions, Dev persona)
+                                                    → Claude Agent SDK → Claude API
+                                                        (agent/sdk_client.py)
 ```
+
+**Session Types** (see `docs/features/chat-dev-session-architecture.md`):
+- **ChatSession** (`session_type="chat"`) - Orchestrates work, PM persona, read-only
+- **DevSession** (`session_type="dev"`) - Does coding work, Dev persona, full permissions
+- **Nudge loop** - Bridge output routing (deliver or nudge, no SDLC awareness)
 
 **Key Directories:**
 - `.claude/commands/` - Slash command skills
-- `.claude/agents/` - Subagent definitions
-- `bridge/` - Telegram integration
+- `.claude/agents/` - Subagent definitions (including `dev-session`)
+- `bridge/` - Telegram integration, nudge loop
 - `tools/` - Local Python tools
 - `config/` - Configuration files
 
@@ -197,7 +245,7 @@ See `docs/features/session-isolation.md` for the full technical design.
 
 - **Bridge Issues**: `./scripts/valor-service.sh restart`
 - **Telegram Auth**: `python scripts/telegram_login.py`
-- **SDK Issues**: Check `USE_CLAUDE_SDK=true` in `.env`
+- **SDK Issues**: Check SDK configuration in `.env`
 
 ### Self-Healing System
 
@@ -215,12 +263,12 @@ The bridge includes automatic crash recovery (see `docs/features/bridge-self-hea
 ### Configuration Files
 
 - `.env` - Environment variables and API keys
-- `config/projects.json` - Multi-project configuration
+- `~/Desktop/Valor/projects.json` - Multi-project configuration (iCloud-synced, private)
 - `.claude/settings.local.json` - Claude Code settings
 
 ## Plan Requirements (This Repo Only)
 
-Plans created with `/do-plan` must include three required sections. These are enforced by hooks that block plan creation if sections are missing or empty.
+Plans created with `/do-plan` must include four required sections. These are enforced by hooks that block plan creation if sections are missing or empty.
 
 ### ## Documentation (Required)
 
@@ -261,6 +309,27 @@ The **## Agent Integration** section should cover:
 - Integration tests that verify the agent can actually invoke the new tools
 - If no agent integration is needed, state that explicitly (e.g., "No agent integration required — this is a bridge-internal change")
 
+### ## Test Impact (Required)
+
+Include a **## Test Impact** section after **## Failure Path Test Strategy** and before **## Rabbit Holes**. This section audits existing tests that will break or need changes due to the planned work. It is enforced by `.claude/hooks/validators/validate_test_impact_section.py`.
+
+The **## Test Impact** section must contain:
+- Checklist items listing affected test files/cases with dispositions: UPDATE, DELETE, or REPLACE
+- If no existing tests are affected, explicitly state "No existing tests affected" with justification (50+ chars)
+
+Example:
+```markdown
+## Test Impact
+- [ ] `tests/unit/test_example.py::test_old_behavior` — UPDATE: assert new return value
+- [ ] `tests/integration/test_flow.py::test_end_to_end` — REPLACE: rewrite for new API
+```
+
+Or for greenfield work:
+```markdown
+## Test Impact
+No existing tests affected — this is a greenfield feature with no prior test coverage.
+```
+
 ## See Also
 
 | Resource | Purpose |
@@ -274,6 +343,7 @@ The **## Agent Integration** section should cover:
 | `docs/tools-reference.md` | Complete tool documentation |
 | `config/SOUL.md` | Valor persona and philosophy |
 | `docs/features/README.md` | Feature index — look up how things work |
+| `tests/README.md` | Test suite index — feature markers, blind spots, contribution guide |
 
 ## Business Context
 

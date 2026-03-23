@@ -7,7 +7,7 @@ context: fork
 
 # Documentation Audit Skill
 
-Systematically audits every documentation file in `docs/` against the actual codebase. Works on any repository. Verifies concrete references (file paths, class names, function names, CLI commands, env vars, packages) exist in the codebase. Issues verdicts of KEEP, UPDATE, or DELETE for each file, applies the changes, sweeps index files for broken links, enforces canonical directory structure, then commits with a detailed summary.
+Systematically audits every documentation file in `docs/` against the actual codebase. Works on any repository. Verifies concrete references (file paths, class names, function names, CLI commands, env vars, packages) exist in the codebase. Issues verdicts of KEEP, UPDATE, or DELETE for each file, applies the changes, sweeps index files for broken links, enforces canonical directory structure, then commits with a concise summary of actual changes (routing large audits to GitHub issues instead of bloated commit messages).
 
 ## When to Use
 
@@ -66,7 +66,7 @@ REFERENCE TYPES TO EXTRACT:
 - CLI commands (e.g., "./scripts/start_bridge.sh", "valor-telegram", "python scripts/reflections.py")
 - Environment variables (e.g., "ANTHROPIC_API_KEY", "TELEGRAM_API_ID")
 - Package/module names (e.g., "telethon", "anthropic", "claude-agent-sdk")
-- Config file keys (e.g., "USE_CLAUDE_SDK", "SENTRY_DSN")
+- Config file keys (e.g., "SENTRY_DSN", "ACTIVE_PROJECTS")
 - Script names in scripts/ directory
 
 VERIFICATION STEPS (use Glob, Grep, Read, Bash tools):
@@ -235,29 +235,71 @@ List each relocated file:
 
 ---
 
-## Step 7: Commit with Detailed Summary
+## Step 7: Create Branch, Commit, and Open PR
 
-Stage all changes and commit with a message that lists each file's verdict and rationale:
+**If 0 changes** (all verdicts were KEEP): Skip this step entirely. Report "No changes needed — all docs are accurate." and proceed to the Output Report.
+
+### 7.1: Create a branch and commit
 
 ```bash
+git checkout -b docs-audit-$(date +%Y%m%d)
 git add -A docs/ CLAUDE.md
 git commit -m "$(cat <<'EOF'
-Docs audit: remove stale, correct outdated references
+Docs audit: fix {N} documentation issues
 
-Results:
-{for each file: "- {VERDICT} {path}: {rationale}"}
-{for each relocation: "- RELOCATED {old} -> {new}"}
-
-Kept: {N} | Updated: {N} | Deleted: {N} | Relocated: {N}
+Updated: {U} | Deleted: {D} | Relocated: {R} | Kept: {K}
 EOF
 )"
 ```
+
+### 7.2: Push and open a PR
+
+Push the branch and create a PR. The PR body contains the full audit report — this is where the detail lives.
+
+```bash
+git push -u origin HEAD
+gh pr create --title "Docs audit: fix {N} documentation issues" --body "$(cat <<'EOF'
+## Documentation Audit Report
+
+**Scanned**: {total} files
+**Updated**: {U} | **Deleted**: {D} | **Relocated**: {R} | **Kept**: {K}
+
+### Files Changed
+
+{for each UPDATE file: "- **UPDATE** `{path}`: {rationale} — corrections: {list corrections}"}
+{for each DELETE file: "- **DELETE** `{path}`: {rationale}"}
+{for each RELOCATED file: "- **RELOCATED** `{old}` → `{new}`"}
+
+### Files Kept (no changes needed)
+
+<details>
+<summary>{K} files unchanged</summary>
+
+{for each KEEP file: "- `{path}`"}
+
+</details>
+EOF
+)"
+```
+
+### 7.3: Return to main
+
+```bash
+git checkout main
+```
+
+### Commit Message Rules
+
+1. **Never list KEEP verdicts** in commit messages — they represent no change
+2. **Never dump the full audit report** into a commit message — the PR body has it
+3. **Only reference files that were actually modified** in the working tree
+4. **Keep commit messages under 50 lines**
 
 ---
 
 ## Output Report
 
-After committing, print the final audit report:
+After opening the PR, print the final audit report:
 
 ```
 ## Documentation Audit Complete
@@ -281,8 +323,8 @@ After committing, print the final audit report:
 #### Relocated
 - `docs/architecture/system-overview.md` → `docs/features/system-overview.md`
 
-### Committed
-{commit SHA}
+### PR
+{PR URL}
 ```
 
 ---

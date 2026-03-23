@@ -41,23 +41,52 @@ DEFAULT_MENTIONS = []
 # =============================================================================
 
 
+def _resolve_config_path() -> Path:
+    """Resolve projects.json path from env var or default location.
+
+    Resolution order:
+    1. PROJECTS_CONFIG_PATH env var (explicit override)
+    2. ~/Desktop/Valor/projects.json (iCloud-synced default)
+    3. config/projects.json (legacy in-repo fallback)
+    """
+    import os
+
+    env_path = os.environ.get("PROJECTS_CONFIG_PATH")
+    if env_path:
+        return Path(env_path).expanduser()
+
+    desktop_path = Path.home() / "Desktop" / "Valor" / "projects.json"
+    if desktop_path.exists():
+        return desktop_path
+
+    # Legacy fallback: in-repo config
+    return Path(__file__).parent.parent / "config" / "projects.json"
+
+
 def load_config() -> dict:
-    """Load project configuration from projects.json."""
-    config_path = Path(__file__).parent.parent / "config" / "projects.json"
-    example_path = config_path.with_suffix(".json.example")
+    """Load project configuration from projects.json.
+
+    Loads from ~/Desktop/Valor/projects.json by default (iCloud-synced, private).
+    Override with PROJECTS_CONFIG_PATH env var.
+    Falls back to config/projects.json if ~/Desktop/Valor/ path doesn't exist.
+    """
+    config_path = _resolve_config_path()
 
     if not config_path.exists():
-        if example_path.exists():
-            logger.error(
-                f"Project config not found at {config_path}. "
-                f"Copy the example: cp {example_path} {config_path}"
-            )
-        else:
-            logger.warning(f"Project config not found at {config_path}, using defaults")
+        logger.warning(f"Project config not found at {config_path}, using defaults")
         return {"projects": {}, "defaults": {}}
 
     with open(config_path) as f:
         config = json.load(f)
+
+    # Expand ~ in working_directory values
+    for _proj in config.get("projects", {}).values():
+        wd = _proj.get("working_directory", "")
+        if wd.startswith("~"):
+            _proj["working_directory"] = str(Path(wd).expanduser())
+    _defs = config.get("defaults", {})
+    if _defs.get("working_directory", "").startswith("~"):
+        _defs["working_directory"] = str(Path(_defs["working_directory"]).expanduser())
 
     # Validate defaults section exists and has working_directory
     defaults = config.get("defaults", {})
@@ -65,13 +94,13 @@ def load_config() -> dict:
         logger.warning(
             "No 'defaults' section in projects.json. "
             "Add a defaults section with working_directory and telegram settings. "
-            "See config/projects.json.example for proper setup."
+            "See config/projects.example.json for the expected format."
         )
     elif not defaults.get("working_directory"):
         logger.warning(
             "No 'working_directory' in defaults section of projects.json. "
             "Projects without working_directory will fail. "
-            "See config/projects.json.example for proper setup."
+            "Check ~/Desktop/Valor/projects.json and add a working_directory to defaults."
         )
 
     # Validate each active project
@@ -85,7 +114,7 @@ def load_config() -> dict:
             logger.error(
                 f"Project '{project_key}' has no working_directory and no default set. "
                 "The bridge WILL fail when processing messages for this project. "
-                "Fix: add 'working_directory' to the project in config/projects.json"
+                "Fix: add 'working_directory' to the project in ~/Desktop/Valor/projects.json"
             )
         elif not Path(working_dir).exists():
             logger.warning(
@@ -138,6 +167,13 @@ def find_project_for_chat(chat_title: str | None) -> dict | None:
             return project
 
     return None
+
+
+def is_team_chat(chat_title: str | None) -> bool:
+    """Team chats (no Dev:/PM: prefix) are mention-only."""
+    if not chat_title:
+        return False
+    return not chat_title.startswith(("Dev:", "PM:"))
 
 
 # =============================================================================
@@ -261,7 +297,7 @@ def classify_needs_response(text: str) -> bool:
         import ollama
 
         response = ollama.chat(
-            model="llama3.2:3b",
+            model="qwen3:1.7b",
             messages=[
                 {
                     "role": "user",
@@ -357,17 +393,20 @@ def classify_work_request(message: str) -> str:
             logger.info(f"[routing] Classified as passthrough (slash command): {text[:120]}")
             return "passthrough"
 
+    # Fast path: any message containing an issue or PR reference → SDLC
+    # This takes priority over acknowledgment matching because "continue issue 463"
+    # is SDLC work, not a bare "continue" passthrough.
+    if re.search(r"(?:issue|pr|pull request)\s+#?\d+", text_lower) or re.match(
+        r"^#\d+$", text_lower
+    ):
+        logger.info(f"[routing] Classified as sdlc (issue/PR reference): {text[:120]}")
+        return "sdlc"
+
     # Fast path: short acknowledgments / continuation commands
     first_word = text_lower.split()[0] if text_lower.split() else ""
     if first_word in _PASSTHROUGH_EXACT or text_lower.rstrip("!.,") in _PASSTHROUGH_EXACT:
         logger.info(f"[routing] Classified as passthrough (acknowledgment): {text[:120]}")
         return "passthrough"
-
-    # Fast path: issue/PR references like "issue 123", "issue #123", "pr 363", "PR #363", "pull request 363"
-    # Bare "#N" is intentionally excluded — Telegram consumes the # as a hashtag/topic marker
-    if re.match(r"^(?:issue|pr|pull request)\s+#?\d+$", text_lower):
-        logger.info(f"[routing] Classified as sdlc (issue/PR reference): {text[:120]}")
-        return "sdlc"
 
     # Use Ollama for nuanced classification with Haiku fallback
     try:
@@ -381,17 +420,45 @@ def classify_work_request(message: str) -> str:
         return "question"
 
 
+def _get_principal_priorities_for_classification() -> str:
+    """Load condensed principal context for classification decisions.
+
+    Provides the classifier with project priorities so it can make better
+    routing decisions (e.g., recognizing project names, understanding which
+    requests are high-priority work vs. casual questions).
+
+    Returns:
+        A short principal context string, or empty string if unavailable.
+    """
+    try:
+        from agent.sdk_client import load_principal_context
+
+        return load_principal_context(condensed=True)
+    except Exception:
+        return ""
+
+
 def _classify_work_request_llm(text: str) -> str:
     """Use LLM to classify whether a message is a work request.
 
     Tries Ollama first (fast, local), falls back to Haiku (cheap, reliable).
+    Includes principal context (project priorities) when available.
     """
+    # Inject principal context for better classification of project-related messages
+    principal = _get_principal_priorities_for_classification()
+    principal_hint = ""
+    if principal:
+        principal_hint = f"\n\nContext — active projects and priorities:\n{principal[:500]}\n\n"
+
     prompt = (
         'Classify this message. Reply with ONLY one word: "sdlc" or "question".\n\n'
-        '- "sdlc" = work request: fix bug, add feature, implement, refactor,\n'
-        "  investigate issue, create/update codebase, deploy, resolve problem\n"
-        '- "question" = asking for info, explanation, opinion, status check,\n'
+        '- "sdlc" = work request that could result in code changes or a PR:\n'
+        "  fix bug, add feature, implement, refactor, investigate issue,\n"
+        "  create/update codebase, deploy, resolve problem, continue/resume work\n"
+        '- "question" = purely asking for info, explanation, opinion,\n'
         "  how does X work, what is Y, conversational/social\n\n"
+        "If in doubt, classify as sdlc.\n\n"
+        f"{principal_hint}"
         f"Message: {text[:300]}\n\n"
         "Classification:"
     )
@@ -401,7 +468,7 @@ def _classify_work_request_llm(text: str) -> str:
         import ollama
 
         response = ollama.chat(
-            model="llama3.2:3b",
+            model="qwen3:1.7b",
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0, "num_predict": 10},
         )
@@ -441,6 +508,87 @@ async def classify_work_request_async(message: str) -> str:
     """Async wrapper for work request classification."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, classify_work_request, message)
+
+
+# =============================================================================
+# Escalation Decision Logic
+# =============================================================================
+
+
+def should_escalate_to_human(
+    issue_summary: str,
+    severity: str = "unknown",
+    project_key: str = "",
+) -> dict:
+    """Decide whether an issue warrants escalating (interrupting) the human.
+
+    Uses principal context to understand which projects and problems are
+    high-priority enough to justify an interruption. Without principal
+    context, falls back to conservative defaults.
+
+    Args:
+        issue_summary: Brief description of the issue or blocker.
+        severity: Estimated severity ("critical", "high", "medium", "low", "unknown").
+        project_key: The project this issue relates to (e.g., "valor-ai").
+
+    Returns:
+        Dict with keys:
+        - escalate: bool — whether to interrupt the human
+        - reason: str — explanation of the decision
+        - priority: str — inferred priority level
+    """
+    # Always escalate critical issues regardless of context
+    if severity == "critical":
+        return {
+            "escalate": True,
+            "reason": "Critical severity — always escalate",
+            "priority": "critical",
+        }
+
+    # Load principal context for priority-aware decisions
+    principal = _get_principal_priorities_for_classification()
+
+    if not principal:
+        # No principal context: conservative default — escalate high+, skip medium/low
+        should = severity in ("critical", "high")
+        return {
+            "escalate": should,
+            "reason": f"No principal context available, using severity-based default ({severity})",
+            "priority": severity,
+        }
+
+    # Check if the project is mentioned in principal priorities
+    project_mentioned = project_key.lower() in principal.lower() if project_key else False
+    issue_lower = issue_summary.lower()
+
+    # High-priority project + any non-low severity = escalate
+    if project_mentioned and severity in ("high", "unknown"):
+        return {
+            "escalate": True,
+            "reason": (
+                f"Project '{project_key}' is in principal priorities with {severity} severity"
+            ),
+            "priority": "high",
+        }
+
+    # Check if issue text matches strategic keywords from principal context
+    strategic_keywords = ["mission", "revenue", "production", "outage", "data loss"]
+    if any(kw in issue_lower for kw in strategic_keywords):
+        return {
+            "escalate": True,
+            "reason": "Issue matches strategic keywords from principal context",
+            "priority": "high",
+        }
+
+    # Default: don't escalate low/medium issues for non-priority projects
+    return {
+        "escalate": severity == "high",
+        "reason": (
+            f"Standard priority assessment"
+            f" (severity={severity}, project_in_priorities={project_mentioned})"
+        ),
+        "priority": severity,
+    }
 
 
 # =============================================================================
@@ -541,6 +689,14 @@ async def should_respond_async(
                 return True, True
         except Exception as e:
             logger.debug(f"Could not check replied message: {e}")
+
+    # Team chats (no Dev:/PM: prefix) are mention-only
+    if is_team_chat(chat_title):
+        mentions = telegram_config.get("mention_triggers", DEFAULT_MENTIONS)
+        text_lower = text.lower()
+        if any(mention.lower() in text_lower for mention in mentions):
+            return True, False
+        return False, False
 
     # respond_to_all means respond to everything
     if telegram_config.get("respond_to_all", True):

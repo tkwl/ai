@@ -8,7 +8,7 @@ The Telegram bridge (`bridge/telegram_bridge.py`) is organized into focused sub-
 | `bridge/routing.py` | Message routing, project config, mention/response classification |
 | `bridge/context.py` | Context building, conversation history, reply chains |
 | `bridge/response.py` | Message formatting, reactions, file extraction, sending |
-| `bridge/agents.py` | Agent invocation, retry logic, self-healing |
+| `bridge/catchup.py` | Abandoned session revival and re-enqueueing |
 
 ## telegram_bridge.py
 
@@ -34,4 +34,4 @@ from bridge.telegram_bridge import get_media_type
 
 ## Configuration Propagation
 
-Sub-modules that depend on runtime configuration (loaded from `config/projects.json` and `.env`) receive it via module-level attribute assignment in `telegram_bridge.py` at startup. This avoids circular imports while ensuring sub-module functions have access to config, project mappings, and active project lists.
+Sub-modules that depend on runtime configuration (loaded from `~/Desktop/Valor/projects.json` and `.env`) receive it via module-level attribute assignment in `telegram_bridge.py` at startup. This avoids circular imports while ensuring sub-module functions have access to config, project mappings, and active project lists.

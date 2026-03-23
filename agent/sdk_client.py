@@ -2,7 +2,7 @@
 Claude Agent SDK client wrapper for Valor.
 
 This module provides a wrapper around ClaudeSDKClient configured for Valor's use case:
-- Loads system prompt from SOUL.md
+- Loads system prompt via the configurable persona system
 - Configures permission mode for autonomous operation
 - Handles session management
 - Extracts text response from message stream
@@ -21,6 +21,7 @@ Authentication strategy (subscription-first):
       programmatic control. Fewer built-in tools but subscription-native.
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -37,8 +38,9 @@ from claude_agent_sdk import (
 
 from agent.agent_definitions import get_agent_definitions
 from agent.hooks import build_hooks_config
-from agent.workflow_state import WorkflowState
-from agent.workflow_types import WorkflowStateData
+from agent.worktree_manager import WORKTREES_DIR, validate_workspace
+from utils.github_patterns import ISSUE_NUMBER_RE as _ISSUE_NUMBER_RE
+from utils.github_patterns import PR_NUMBER_RE as _PR_NUMBER_RE
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +58,47 @@ _active_clients: dict[str, "ClaudeSDKClient"] = {}
 # In-memory only — cleared when the session finishes.
 _session_stop_reasons: dict[str, str] = {}
 
+# === Activity Tracking ===
+# Tracks the timestamp of the last tool call or log output for each session.
+# Used by the watchdog heartbeat for activity-based stall detection instead
+# of hard wall-clock timeouts. Updated on each tool call callback and log output.
+# In-memory only — reset on crash/reboot (new sessions start fresh).
+_last_activity_timestamps: dict[str, float] = {}
+
+# Configurable inactivity threshold (seconds). Sessions idle longer than this
+# are considered stalled. Active sessions producing tool calls/logs are never
+# interrupted regardless of total runtime.
+SDK_INACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("SDK_INACTIVITY_TIMEOUT_SECONDS", 300))
+
 
 def get_stop_reason(session_id: str) -> str | None:
     """Get and consume the stop_reason for a completed session query."""
     return _session_stop_reasons.pop(session_id, None)
+
+
+def record_session_activity(session_id: str) -> None:
+    """Record that a session produced activity (text output or result message).
+
+    Called on text block output and result messages during SDK query execution.
+    The watchdog uses this to detect stalls based on inactivity rather than
+    wall-clock duration.
+    """
+    _last_activity_timestamps[session_id] = time.time()
+
+
+def get_session_last_activity(session_id: str) -> float | None:
+    """Get the timestamp of the last activity for a session.
+
+    Returns:
+        Unix timestamp of last tool call or log output, or None if
+        no activity has been recorded for this session.
+    """
+    return _last_activity_timestamps.get(session_id)
+
+
+def clear_session_activity(session_id: str) -> None:
+    """Remove activity tracking for a completed/abandoned session."""
+    _last_activity_timestamps.pop(session_id, None)
 
 
 def _get_prior_session_uuid(session_id: str) -> str | None:
@@ -146,6 +185,87 @@ def _store_claude_session_uuid(session_id: str, claude_uuid: str) -> None:
         )
 
 
+def _extract_sdlc_env_vars(session_id: str, gh_repo: str | None = None) -> dict[str, str]:
+    """Extract SDLC context variables from an AgentSession for env injection.
+
+    Reads the AgentSession from Redis and maps its fields to SDLC_* env vars.
+    Only returns vars for fields that are non-None and non-empty, ensuring
+    skills never see "None" as a value (issue #420).
+
+    Args:
+        session_id: The bridge/Telegram session ID.
+        gh_repo: Optional GH_REPO already set on the agent.
+
+    Returns:
+        Dict of SDLC_* env var name -> value. Empty dict if session not found.
+    """
+    env: dict[str, str] = {}
+    try:
+        from models.agent_session import AgentSession
+
+        sessions = list(AgentSession.query.filter(session_id=session_id))
+        if not sessions:
+            return env
+        # Pick the newest active session
+        active = [s for s in sessions if s.status in ("running", "active", "pending")]
+        candidates = active if active else sessions
+        candidates.sort(key=lambda s: s.created_at or 0, reverse=True)
+        session = candidates[0]
+
+        # PR URL -> SDLC_PR_NUMBER and SDLC_PR_BRANCH
+        # Use isinstance(str) guards to prevent TypeError from non-string
+        # ORM field values (e.g. Popoto proxy objects).
+        pr_url = getattr(session, "pr_url", None)
+        if isinstance(pr_url, str) and pr_url:
+            pr_match = _PR_NUMBER_RE.search(pr_url)
+            if pr_match:
+                env["SDLC_PR_NUMBER"] = pr_match.group(1)
+
+        # Branch name
+        branch = getattr(session, "branch_name", None)
+        if isinstance(branch, str) and branch:
+            env["SDLC_PR_BRANCH"] = branch
+
+        # Work item slug (new DevSessions use session.slug, legacy uses work_item_slug)
+        slug = getattr(session, "slug", None) or getattr(session, "work_item_slug", None)
+        if isinstance(slug, str) and slug:
+            env["SDLC_SLUG"] = slug
+
+        # Plan URL -> SDLC_PLAN_PATH (convert URL to local path)
+        plan_url = getattr(session, "plan_url", None)
+        if isinstance(plan_url, str) and plan_url:
+            # plan_url is typically a GitHub URL or a local path
+            # Extract the path portion (docs/plans/...)
+            if "docs/plans/" in plan_url:
+                plan_path = "docs/plans/" + plan_url.split("docs/plans/")[-1]
+                env["SDLC_PLAN_PATH"] = plan_path
+            else:
+                env["SDLC_PLAN_PATH"] = plan_url
+
+        # Issue URL -> SDLC_ISSUE_NUMBER
+        issue_url = getattr(session, "issue_url", None)
+        if isinstance(issue_url, str) and issue_url:
+            issue_match = _ISSUE_NUMBER_RE.search(issue_url)
+            if issue_match:
+                env["SDLC_ISSUE_NUMBER"] = issue_match.group(1)
+
+        # Repo (complement GH_REPO, don't replace it)
+        if gh_repo:
+            env["SDLC_REPO"] = gh_repo
+
+        if env:
+            logger.info(
+                f"SDLC env vars for session {session_id}: "
+                f"{', '.join(f'{k}={v}' for k, v in sorted(env.items()))}"
+            )
+    except Exception:
+        logger.warning(
+            f"_extract_sdlc_env_vars({session_id!r}) failed, skipping SDLC vars",
+            exc_info=True,
+        )
+    return env
+
+
 def get_active_client(session_id: str) -> ClaudeSDKClient | None:
     """Get the live SDK client for a running session, if any.
 
@@ -164,21 +284,28 @@ def get_all_active_sessions() -> dict[str, "ClaudeSDKClient"]:
 # Root of the ai/ repository (used as cwd for SDLC-routed requests)
 AI_REPO_ROOT = str(Path(__file__).parent.parent)
 
-# Path to SOUL.md system prompt
+# Path to SOUL.md system prompt (legacy fallback)
 SOUL_PATH = Path(__file__).parent.parent / "config" / "SOUL.md"
 
-# Log a warning when a single query's equivalent API cost exceeds this
-_COST_WARN_THRESHOLD = float(os.getenv("SDK_COST_WARN_THRESHOLD", "0.50"))
+# Path to persona base file (stays in repo — not private)
+PERSONAS_BASE_DIR = Path(__file__).parent.parent / "config" / "personas"
+
+# Path to persona overlay files (private, iCloud-synced)
+# Overlays live in ~/Desktop/Valor/personas/ — falls back to config/personas/ for dev
+PERSONAS_OVERLAY_DIR = Path.home() / "Desktop" / "Valor" / "personas"
+
+# Path to PRINCIPAL.md — supervisor's operating context for strategic decisions
+PRINCIPAL_PATH = Path(__file__).parent.parent / "config" / "PRINCIPAL.md"
 
 # Worker safety rails injected into every agent session.
-# The Observer Agent (bridge/observer.py) is the sole pipeline controller —
+# ChatSession is the sole pipeline controller —
 # it steers the worker one stage at a time via coaching messages.
 # This constant provides only the safety rails the worker needs; it does NOT
 # contain pipeline orchestration or /sdlc invocation instructions.
 WORKER_RULES = """\
 ## Worker Safety Rails
 
-Execute the task given to you. The Observer Agent controls pipeline progression — \
+Execute the task given to you. The ChatSession controls pipeline progression — \
 you do not need to manage stages or orchestrate the pipeline yourself.
 
 ### Hard rules:
@@ -265,43 +392,172 @@ def load_completion_criteria() -> str:
     return match.group(0) if match else ""
 
 
+def load_principal_context(condensed: bool = True) -> str:
+    """Load principal (supervisor) context from PRINCIPAL.md.
+
+    Provides strategic context for decision-making: mission, goals, project
+    priorities, and operating assumptions. Used by workers (condensed) and
+    the ChatSession (full) to ground autonomous decisions.
+
+    Args:
+        condensed: If True, return only Mission + Goals + Projects sections
+                   (~300 tokens). If False, return the full file content.
+
+    Returns:
+        Principal context string, or empty string if file is missing/empty.
+    """
+    if not PRINCIPAL_PATH.exists():
+        logger.warning(f"PRINCIPAL.md not found at {PRINCIPAL_PATH}, skipping principal context")
+        return ""
+
+    content = PRINCIPAL_PATH.read_text().strip()
+    if not content:
+        logger.warning("PRINCIPAL.md is empty, skipping principal context")
+        return ""
+
+    if not condensed:
+        return content
+
+    # Extract condensed summary: Mission + Goals + Projects sections only.
+    # This keeps the worker prompt lean while providing strategic context.
+    import re
+
+    sections_to_extract = ["Mission", r"Goals[^\n]*", r"Projects[^\n]*"]
+    extracted = []
+    for pattern in sections_to_extract:
+        match = re.search(
+            rf"^(## {pattern})\n\n(.*?)(?=\n---|\n## |\Z)",
+            content,
+            re.MULTILINE | re.DOTALL,
+        )
+        if match:
+            extracted.append(f"{match.group(1)}\n\n{match.group(2).strip()}")
+
+    if not extracted:
+        # Fallback: return first 500 chars if section extraction fails
+        return content[:500]
+
+    return "\n\n".join(extracted)
+
+
+def _resolve_overlay_path(persona: str) -> Path:
+    """Resolve persona overlay file path.
+
+    Checks ~/Desktop/Valor/personas/{persona}.md first (private, iCloud-synced),
+    then falls back to config/personas/{persona}.md (in-repo, for development).
+    """
+    overlay_path = PERSONAS_OVERLAY_DIR / f"{persona}.md"
+    if overlay_path.exists():
+        return overlay_path
+
+    # Fallback: in-repo overlay (for development or when Desktop/Valor not available)
+    return PERSONAS_BASE_DIR / f"{persona}.md"
+
+
+def load_persona_prompt(persona: str = "developer") -> str:
+    """Load persona prompt from base + overlay files.
+
+    Base is read from config/personas/_base.md (in-repo, shared).
+    Overlays are read from ~/Desktop/Valor/personas/{persona}.md (private, iCloud-synced).
+    Falls back to config/SOUL.md if persona files are missing.
+
+    Args:
+        persona: Persona name — one of "developer", "project-manager", "teammate".
+            Defaults to "developer".
+
+    Returns:
+        Combined persona prompt (base + overlay).
+
+    Raises:
+        FileNotFoundError: If _base.md is missing (base is required).
+    """
+    base_path = PERSONAS_BASE_DIR / "_base.md"
+
+    # Base is required — fail loudly if missing
+    if not base_path.exists():
+        raise FileNotFoundError(
+            f"Persona base file not found at {base_path}. "
+            "The _base.md file is required for the persona system."
+        )
+
+    base_content = base_path.read_text()
+
+    # Resolve overlay: ~/Desktop/Valor/personas/ first, then config/personas/
+    overlay_path = _resolve_overlay_path(persona)
+
+    # Overlay is optional — fall back to SOUL.md if missing
+    if overlay_path.exists():
+        overlay_content = overlay_path.read_text()
+        logger.info(f"Loaded persona '{persona}' from {overlay_path}")
+        return f"{base_content}\n\n---\n\n{overlay_content}"
+
+    # Invalid persona name — fall back to developer with warning
+    if persona not in ("developer", "project-manager", "teammate"):
+        logger.warning(f"Unknown persona '{persona}', falling back to developer persona")
+        developer_path = _resolve_overlay_path("developer")
+        if developer_path.exists():
+            return f"{base_content}\n\n---\n\n{developer_path.read_text()}"
+
+    # Persona overlay missing — fall back to SOUL.md
+    logger.warning(
+        f"Persona overlay '{persona}' not found at {overlay_path}, falling back to SOUL.md"
+    )
+    if SOUL_PATH.exists():
+        return SOUL_PATH.read_text()
+
+    logger.warning(f"SOUL.md not found at {SOUL_PATH}, using default prompt")
+    return "You are Valor, an AI coworker. Be direct, concise, and helpful."
+
+
 def load_system_prompt() -> str:
-    """Load Valor's system prompt from SOUL.md with worker rules and completion criteria.
+    """Load developer system prompt with worker rules and completion criteria.
+
+    Wraps load_persona_prompt("developer") with WORKER_RULES and additional context.
+    This is the default prompt for AgentSDK coding subprocesses.
 
     System prompt structure:
         [WORKER_RULES — safety rails for the worker, FIRST — takes precedence]
         ---
-        [SOUL.md — persona, attitude, purpose, communication style]
+        [Persona prompt — base + developer overlay]
+        ---
+        [Principal Context — condensed mission/goals/priorities from PRINCIPAL.md]
         ---
         [Work Completion Criteria — from CLAUDE.md]
 
-    The Observer Agent (bridge/observer.py) handles pipeline orchestration.
+    ChatSession handles pipeline orchestration via nudge loop.
     The worker only receives safety rails — no pipeline stages or /sdlc references.
     """
-    soul_prompt = ""
-    if SOUL_PATH.exists():
-        soul_prompt = SOUL_PATH.read_text()
-    else:
-        logger.warning(f"SOUL.md not found at {SOUL_PATH}, using default prompt")
-        soul_prompt = "You are Valor, an AI coworker. Be direct, concise, and helpful."
+    try:
+        persona_prompt = load_persona_prompt("developer")
+    except FileNotFoundError:
+        # Fallback to legacy SOUL.md if persona system not set up
+        logger.warning("Persona system not available, falling back to SOUL.md")
+        if SOUL_PATH.exists():
+            persona_prompt = SOUL_PATH.read_text()
+        else:
+            persona_prompt = "You are Valor, an AI coworker. Be direct, concise, and helpful."
 
     # Append completion criteria
     criteria = load_completion_criteria()
     criteria_section = f"\n\n---\n\n{criteria}" if criteria else ""
 
+    # Load condensed principal context (mission + goals + project priorities)
+    principal = load_principal_context(condensed=True)
+    principal_section = f"\n\n---\n\n## Principal Context\n\n{principal}" if principal else ""
+
     # Worker rules FIRST — safety rails take precedence over persona
-    return f"{WORKER_RULES}\n\n---\n\n{soul_prompt}{criteria_section}"
+    return f"{WORKER_RULES}\n\n---\n\n{persona_prompt}{principal_section}{criteria_section}"
 
 
 def load_pm_system_prompt(working_directory: str) -> str:
     """Load system prompt for PM (Project Manager) mode channels.
 
-    PM mode skips WORKER_RULES (no branch safety rails) and loads
-    the project-specific CLAUDE.md from the work vault directory if it exists.
-    Falls back to SOUL.md persona only.
+    Uses the project-manager persona (base + PM overlay). PM mode skips
+    WORKER_RULES (no branch safety rails) and loads the project-specific
+    CLAUDE.md from the work vault directory if it exists.
 
     System prompt structure:
-        [SOUL.md — persona, attitude, purpose, communication style]
+        [Persona prompt — base + project-manager overlay]
         ---
         [Work-vault CLAUDE.md — PM-specific instructions for this project]
 
@@ -311,23 +567,25 @@ def load_pm_system_prompt(working_directory: str) -> str:
     Returns:
         Combined system prompt for PM mode.
     """
-    # Load SOUL.md for persona (Valor's attitude/style is valuable in PM mode too)
-    soul_prompt = ""
-    if SOUL_PATH.exists():
-        soul_prompt = SOUL_PATH.read_text()
-    else:
-        logger.warning(f"SOUL.md not found at {SOUL_PATH}, using default prompt")
-        soul_prompt = "You are Valor, an AI coworker. Be direct, concise, and helpful."
+    try:
+        persona_prompt = load_persona_prompt("project-manager")
+    except FileNotFoundError:
+        # Fallback to legacy SOUL.md if persona system not set up
+        logger.warning("Persona system not available for PM, falling back to SOUL.md")
+        if SOUL_PATH.exists():
+            persona_prompt = SOUL_PATH.read_text()
+        else:
+            persona_prompt = "You are Valor, an AI coworker. Be direct, concise, and helpful."
 
     # Try to load project-specific CLAUDE.md from work-vault directory
     project_claude_path = Path(working_directory) / "CLAUDE.md"
     if project_claude_path.exists():
         project_instructions = project_claude_path.read_text()
         logger.info(f"Loaded PM instructions from {project_claude_path}")
-        return f"{soul_prompt}\n\n---\n\n{project_instructions}"
+        return f"{persona_prompt}\n\n---\n\n{project_instructions}"
 
-    logger.info(f"No CLAUDE.md found at {project_claude_path}, using SOUL.md only for PM mode")
-    return soul_prompt
+    logger.info(f"No CLAUDE.md found at {project_claude_path}, using persona only for PM mode")
+    return persona_prompt
 
 
 def _is_code_file(file_path: str) -> bool:
@@ -512,13 +770,14 @@ class ValorAgent:
         working_dir: str | Path | None = None,
         system_prompt: str | None = None,
         permission_mode: str = "bypassPermissions",
-        workflow_id: str | None = None,
         task_list_id: str | None = None,
-        max_budget_usd: float | None = None,
         chat_id: str | None = None,
         project_key: str | None = None,
         message_id: int | None = None,
         job_id: str | None = None,
+        gh_repo: str | None = None,
+        target_repo: str | None = None,
+        session_type: str | None = None,
     ):
         """
         Initialize ValorAgent.
@@ -527,116 +786,36 @@ class ValorAgent:
             working_dir: Working directory for the agent. Defaults to ai/ repo root.
             system_prompt: Custom system prompt. Defaults to SOUL.md contents.
             permission_mode: Permission mode for tool use. Default: "bypassPermissions".
-            workflow_id: Optional workflow ID for multi-phase workflow tracking.
             task_list_id: Optional task list ID to scope sub-agent Task storage
                 via CLAUDE_CODE_TASK_LIST_ID environment variable.
-            max_budget_usd: Maximum budget in USD for a single agent session.
-                Defaults to SDK_MAX_BUDGET_USD env var or 5.00.
             chat_id: Optional chat ID for routing context injection.
             project_key: Optional project key for routing context injection.
             message_id: Optional message ID for routing context injection.
             job_id: Optional job ID injected as JOB_ID env var for child job spawning.
+            gh_repo: Optional GitHub repo (org/repo) to set as GH_REPO env var.
+                When set, all `gh` CLI commands in the subprocess automatically
+                target this repo without needing explicit --repo flags.
+            target_repo: Absolute path to the target project's repo root. For
+                cross-repo SDLC builds this differs from working_dir (the
+                orchestrator). Defaults to working_dir when not specified.
+            session_type: Session type ("chat" for PM, None for dev). Injected as
+                SESSION_TYPE env var so hooks can enforce write restrictions.
         """
-        self.working_dir = Path(working_dir) if working_dir else Path(__file__).parent.parent
+        default_dir = Path(__file__).parent.parent
+        allowed_root = Path.home() / "src"
+        raw_path = Path(working_dir) if working_dir else default_dir
+        is_wt = WORKTREES_DIR in str(raw_path)
+        self.working_dir = validate_workspace(raw_path, allowed_root, is_worktree=is_wt)
         self.system_prompt = system_prompt or load_system_prompt()
         self.permission_mode = permission_mode
-        self.workflow_id = workflow_id
         self.task_list_id = task_list_id
-        self.max_budget_usd = max_budget_usd or float(os.getenv("SDK_MAX_BUDGET_USD", "5.00"))
         self.chat_id = chat_id
         self.project_key = project_key
         self.message_id = message_id
         self.job_id = job_id
-        self.workflow_state: WorkflowState | None = None
-
-        # Load workflow state if workflow_id provided
-        if self.workflow_id:
-            try:
-                self.workflow_state = WorkflowState.load(self.workflow_id)
-                phase = self.workflow_state.data.phase if self.workflow_state.data else None
-                logger.info(f"Loaded workflow state: {self.workflow_id} (phase={phase})")
-            except FileNotFoundError:
-                logger.warning(
-                    f"Workflow ID {self.workflow_id} provided but no state file found. "
-                    "Continuing without workflow state."
-                )
-            except Exception as e:
-                logger.error(f"Failed to load workflow state for {self.workflow_id}: {e}")
-                # Continue without workflow state rather than failing initialization
-
-    def _build_workflow_context(self) -> str:
-        """Build workflow context string for system prompt.
-
-        Returns:
-            Formatted workflow context including ID, phase, status, and plan file.
-        """
-        if not self.workflow_state or not self.workflow_state.data:
-            return ""
-
-        data = self.workflow_state.data
-        context_parts = [
-            "---",
-            "WORKFLOW CONTEXT:",
-            f"- Workflow ID: {data.workflow_id}",
-            f"- Plan: {data.plan_file}",
-        ]
-
-        if data.phase:
-            context_parts.append(f"- Current Phase: {data.phase}")
-        if data.status:
-            context_parts.append(f"- Status: {data.status}")
-        if data.branch_name:
-            context_parts.append(f"- Branch: {data.branch_name}")
-        if data.tracking_url:
-            context_parts.append(f"- Tracking: {data.tracking_url}")
-
-        context_parts.append("---")
-        return "\n".join(context_parts)
-
-    def update_workflow_state(
-        self, phase: str | None = None, status: str | None = None, **kwargs
-    ) -> None:
-        """Update workflow state and persist to disk.
-
-        Args:
-            phase: Optional workflow phase to update
-            status: Optional workflow status to update
-            **kwargs: Additional state fields to update
-
-        Raises:
-            ValueError: If no workflow_state is loaded
-        """
-        if not self.workflow_state:
-            raise ValueError(
-                "Cannot update workflow state - no workflow_id provided at initialization"
-            )
-
-        # Build update dict
-        update_dict = {}
-        if phase is not None:
-            update_dict["phase"] = phase
-        if status is not None:
-            update_dict["status"] = status
-        update_dict.update(kwargs)
-
-        # Update and save
-        self.workflow_state.update(**update_dict)
-        self.workflow_state.save()
-        logger.info(
-            f"Updated workflow state: {self.workflow_id} "
-            f"(phase={self.workflow_state.data.phase if self.workflow_state.data else None}, "
-            f"status={self.workflow_state.data.status if self.workflow_state.data else None})"
-        )
-
-    def get_workflow_data(self) -> WorkflowStateData | None:
-        """Get current workflow state data.
-
-        Returns:
-            WorkflowStateData if workflow state is loaded, None otherwise
-        """
-        if self.workflow_state:
-            return self.workflow_state.data
-        return None
+        self.gh_repo = gh_repo or None  # Normalize empty string to None
+        self.target_repo = target_repo
+        self.session_type = session_type
 
     def _create_options(self, session_id: str | None = None) -> ClaudeAgentOptions:
         """Create ClaudeAgentOptions configured for Valor with full permissions.
@@ -675,12 +854,34 @@ class ValorAgent:
         if self.job_id:
             env["JOB_ID"] = self.job_id
 
-        # Build system prompt with workflow context if workflow_id is present
+        # Cross-repo gh resolution: set GH_REPO so all `gh` CLI commands in the
+        # subprocess automatically target the correct repo (issue #375). This is
+        # the deterministic fix -- SKILL.md --repo instructions remain as a safety net.
+        if self.gh_repo:
+            env["GH_REPO"] = self.gh_repo
+        if self.target_repo:
+            env["SDLC_TARGET_REPO"] = str(self.target_repo)
+        if self.session_type:
+            env["SESSION_TYPE"] = self.session_type
+
+        # PM sessions: inject Sentry auth token so sentry-cli works without
+        # manual export. Token is stored in ~/Desktop/Valor/.env (iCloud-synced).
+        if self.session_type == "chat":
+            sentry_env = Path.home() / "Desktop" / "Valor" / ".env"
+            if sentry_env.exists():
+                for line in sentry_env.read_text().splitlines():
+                    if line.startswith("SENTRY_PERSONAL_TOKEN="):
+                        env["SENTRY_AUTH_TOKEN"] = line.split("=", 1)[1]
+                        break
+
+        # SDLC context injection: pre-resolve session fields as env vars so
+        # skills can reference $SDLC_PR_NUMBER etc. instead of guessing (issue #420).
+        # Only set vars when the field is non-None and non-empty.
+        if session_id:
+            sdlc_env = _extract_sdlc_env_vars(session_id, self.gh_repo)
+            env.update(sdlc_env)
+
         system_prompt = self.system_prompt
-        if self.workflow_id and self.workflow_state and self.workflow_state.data:
-            workflow_context = self._build_workflow_context()
-            system_prompt += f"\n\n{workflow_context}"
-            logger.debug(f"Including workflow context in system prompt: {self.workflow_id}")
 
         # Only continue a conversation if we have evidence of a prior session.
         # Without this check, fresh sessions set continue_conversation=True which
@@ -705,7 +906,7 @@ class ValorAgent:
             hooks=build_hooks_config(),
             agents=get_agent_definitions(),
             max_budget_usd=self.max_budget_usd,
-            model="claude-opus-4-5-20251101",
+            model="claude-opus-4-6",
             effort="max",
             betas=["context-1m-2025-08-07"],
         )
@@ -743,78 +944,105 @@ class ValorAgent:
         _log_system_resources("SDK-init-pre")
 
         try:
-            async with ClaudeSDKClient(options) as client:
-                # Log successful initialization
-                init_elapsed = time.time() - init_start
-                logger.info(f"[SDK-init] SDK initialized successfully in {init_elapsed:.2f}s")
-                _log_system_resources("SDK-init-post")
-                # Register client for steering access
-                if session_id:
-                    _active_clients[session_id] = client
-                    logger.debug(f"Registered active client for session {session_id}")
+            # Safety ceiling timeout: prevents query from blocking a worker
+            # forever if the SDK subprocess hangs. Set high (1 hour) because
+            # the watchdog's activity-based stall detection handles real stalls.
+            # This is only a backstop for truly hung processes.
+            query_timeout = int(os.environ.get("SDK_QUERY_TIMEOUT_SECONDS", 3600))
 
-                await client.query(message)
+            async with asyncio.timeout(query_timeout):
+                async with ClaudeSDKClient(options) as client:
+                    # Log successful initialization
+                    init_elapsed = time.time() - init_start
+                    logger.info(f"[SDK-init] SDK initialized successfully in {init_elapsed:.2f}s")
+                    _log_system_resources("SDK-init-post")
+                    # Register client for steering access
+                    if session_id:
+                        _active_clients[session_id] = client
+                        logger.debug(f"Registered active client for session {session_id}")
 
-                while True:
-                    async for msg in client.receive_response():
-                        if isinstance(msg, AssistantMessage):
-                            for block in msg.content:
-                                if isinstance(block, TextBlock):
-                                    response_parts.append(block.text)
-                        elif isinstance(msg, ResultMessage):
-                            # Bug 1 fix (issue #374): Store Claude Code session UUID
-                            # so continuation sessions resume the correct transcript.
-                            if msg.session_id and session_id:
-                                _store_claude_session_uuid(session_id, msg.session_id)
-                            # Capture stop_reason for Observer routing decisions
-                            if msg.stop_reason and session_id:
-                                _session_stop_reasons[session_id] = msg.stop_reason
-                                logger.info(
-                                    f"SDK stop_reason={msg.stop_reason} for session {session_id}"
-                                )
+                    # Record initial activity when query starts
+                    if session_id:
+                        record_session_activity(session_id)
 
-                            if msg.total_cost_usd is not None:
-                                cost = msg.total_cost_usd
-                                turns = msg.num_turns
-                                duration = msg.duration_ms
-                                # Always log at debug; warn if equivalent
-                                # cost exceeds threshold (sanity check even
-                                # on subscription — tracks what we'd pay on API)
-                                summary = (
-                                    f"Query completed: {turns} turns, "
-                                    f"${cost:.4f} equivalent, "
-                                    f"{duration}ms"
-                                )
-                                if cost >= _COST_WARN_THRESHOLD:
-                                    logger.warning(f"High cost query: {summary}")
-                                else:
+                    await client.query(message)
+
+                    while True:
+                        async for msg in client.receive_response():
+                            if isinstance(msg, AssistantMessage):
+                                for block in msg.content:
+                                    if isinstance(block, TextBlock):
+                                        response_parts.append(block.text)
+                                        # Record activity on each text output
+                                        if session_id:
+                                            record_session_activity(session_id)
+                            elif isinstance(msg, ResultMessage):
+                                # Record activity on result messages
+                                if session_id:
+                                    record_session_activity(session_id)
+                                # Bug 1 fix (issue #374): Store Claude Code session UUID
+                                # so continuation sessions resume the correct transcript.
+                                if msg.session_id and session_id:
+                                    _store_claude_session_uuid(session_id, msg.session_id)
+                                # Capture stop_reason for nudge loop routing decisions
+                                if msg.stop_reason and session_id:
+                                    _session_stop_reasons[session_id] = msg.stop_reason
+                                    logger.info(
+                                        "SDK stop_reason=%s for session %s",
+                                        msg.stop_reason,
+                                        session_id,
+                                    )
+
+                                if msg.total_cost_usd is not None:
+                                    cost = msg.total_cost_usd
+                                    turns = msg.num_turns
+                                    duration = msg.duration_ms
+                                    # Always log at debug; warn if equivalent
+                                    # cost exceeds threshold (sanity check even
+                                    # on subscription — tracks what we'd pay on API)
+                                    summary = (
+                                        f"Query completed: {turns} turns, "
+                                        f"${cost:.4f} equivalent, "
+                                        f"{duration}ms"
+                                    )
                                     logger.info(summary)
-                            if msg.is_error and retries < max_retries:
-                                retries += 1
-                                error_text = msg.result or "(empty)"
-                                recovery_msg = _build_error_recovery_message(error_text)
-                                logger.warning(
-                                    f"Agent error (attempt {retries}/{max_retries}), "
-                                    f"feeding error back: {error_text}"
-                                )
-                                response_parts.clear()
-                                await client.query(recovery_msg)
-                                break  # Re-enter receive_response() loop
-                            elif msg.is_error:
-                                result_text = msg.result or ""
-                                if _is_auth_error(result_text):
-                                    logger.error(
-                                        f"Auth failure after {retries} retries: {result_text}\n"
-                                        "Subscription fallback may be patched. "
-                                        "Set USE_API_BILLING=true or see module docstring."
+                                if msg.is_error and retries < max_retries:
+                                    retries += 1
+                                    error_text = msg.result or "(empty)"
+                                    recovery_msg = _build_error_recovery_message(error_text)
+                                    logger.warning(
+                                        f"Agent error (attempt {retries}/{max_retries}), "
+                                        f"feeding error back: {error_text}"
                                     )
-                                else:
-                                    logger.error(
-                                        f"Agent error after {retries} retries: {result_text}"
-                                    )
-                    else:
-                        # async for completed without break — done
-                        break
+                                    response_parts.clear()
+                                    await client.query(recovery_msg)
+                                    break  # Re-enter receive_response() loop
+                                elif msg.is_error:
+                                    result_text = msg.result or ""
+                                    if _is_auth_error(result_text):
+                                        logger.error(
+                                            f"Auth failure after {retries} retries: {result_text}\n"
+                                            "Subscription fallback may be patched. "
+                                            "Set USE_API_BILLING=true or see module docstring."
+                                        )
+                                    else:
+                                        logger.error(
+                                            f"Agent error after {retries} retries: {result_text}"
+                                        )
+                        else:
+                            # async for completed without break — done
+                            break
+
+        except TimeoutError:
+            elapsed = time.time() - init_start
+            logger.error(
+                "[SDK-timeout] Query timed out after %.0fs for session %s "
+                "(limit=%ds). Subprocess may be hung.",
+                elapsed,
+                session_id,
+                query_timeout,
+            )
+            raise
 
         except Exception as e:
             error_str = str(e)
@@ -882,9 +1110,11 @@ class ValorAgent:
             # Always unregister client from registry
             if session_id:
                 _active_clients.pop(session_id, None)
+                # Clean up activity tracking — session is done
+                clear_session_activity(session_id)
                 # Note: _session_stop_reasons is NOT cleaned here — it's consumed
                 # by get_stop_reason() in job_queue after query returns. The pop()
-                # in get_stop_reason() handles cleanup. If the Observer never runs
+                # in get_stop_reason() handles cleanup. If the nudge loop never runs
                 # (crash), entries are tiny (session_id -> str) and cleared on restart.
                 logger.debug(f"Unregistered active client for session {session_id}")
 
@@ -952,6 +1182,55 @@ def _build_error_recovery_message(error_text: str) -> str:
     )
 
 
+def _resolve_persona(
+    project: dict | None,
+    chat_title: str | None,
+    is_dm: bool = False,
+) -> str:
+    """Resolve the persona name from project config, chat title, and DM status.
+
+    Resolution order:
+    1. DMs: use project's dm_persona config (default: "teammate")
+    2. Group chats: look up persona from project's telegram.groups[chat_title]
+    3. PM mode projects: "project-manager"
+    4. Default: "developer"
+
+    Args:
+        project: Project configuration dict from projects.json.
+        chat_title: Telegram chat/group title, or None for DMs.
+        is_dm: Whether this is a direct message.
+
+    Returns:
+        Persona name string (e.g., "developer", "project-manager", "teammate").
+    """
+    if not project:
+        return "teammate" if is_dm else "developer"
+
+    telegram_config = project.get("telegram", {})
+
+    # DMs use the dm_persona config
+    if is_dm:
+        return telegram_config.get("dm_persona", "teammate")
+
+    # PM mode projects always use project-manager persona
+    project_mode = project.get("mode", "dev")
+    if project_mode == "pm":
+        return "project-manager"
+
+    # Group chats: look up persona from the groups dict
+    if chat_title:
+        groups = telegram_config.get("groups", {})
+        if isinstance(groups, dict):
+            for group_name, group_config in groups.items():
+                if group_name.lower() in chat_title.lower():
+                    if isinstance(group_config, dict):
+                        persona = group_config.get("persona")
+                        if persona:
+                            return persona
+
+    return "developer"
+
+
 async def get_agent_response_sdk(
     message: str,
     session_id: str,
@@ -960,7 +1239,6 @@ async def get_agent_response_sdk(
     project: dict | None,
     chat_id: str | None = None,
     sender_id: int | None = None,
-    workflow_id: str | None = None,
     task_list_id: str | None = None,
     correlation_id: str | None = None,
     job_id: str | None = None,
@@ -979,7 +1257,6 @@ async def get_agent_response_sdk(
         project: Project configuration dict
         chat_id: Chat ID (unused, for compatibility)
         sender_id: Telegram user ID (for permission checking)
-        workflow_id: Optional 8-char workflow identifier for tracked work
         task_list_id: Optional task list ID to scope sub-agent Task storage
         correlation_id: Optional end-to-end tracing ID from the bridge
         job_id: Optional job ID for child job spawning (issue #359)
@@ -1015,10 +1292,40 @@ async def get_agent_response_sdk(
         working_dir = project_working_dir
         logger.info(f"[{request_id}] PM mode: cwd={working_dir}, skipping SDLC classification")
     else:
-        # Dev mode: classify and route as before
-        from bridge.routing import classify_work_request
+        # Dev mode: use classification from bridge (no re-classification).
+        # The bridge handler already classified via routing.py and stored
+        # classification_type on the AgentSession. Read it from session if
+        # available, otherwise fall back to a simple heuristic.
+        classification = None
+        if session_id:
+            try:
+                from models.agent_session import AgentSession
 
-        classification = classify_work_request(message)
+                sessions = list(AgentSession.query.filter(session_id=session_id))
+                active = [s for s in sessions if s.status in ("running", "active", "pending")]
+                candidates = active if active else sessions
+                if candidates:
+                    candidates.sort(key=lambda s: s.created_at or 0, reverse=True)
+                    classification = candidates[0].classification_type
+            except Exception as e:
+                logger.debug(f"[{request_id}] Could not read classification from session: {e}")
+
+        if not classification:
+            # Fallback: check for PR/issue references before defaulting to question.
+            # The async classifier can lose the race with job pickup, so this
+            # fast-path catches messages like "Complete PR 478" that must be SDLC.
+            import re as _re_cls
+
+            if _re_cls.search(
+                r"(?:issue|pr|pull request)\s+#?\d+", message.lower()
+            ) or _re_cls.match(r"^#\d+$", message.strip().lower()):
+                classification = "sdlc"
+                logger.info(
+                    f"[{request_id}] Fast-path SDLC classification (PR/issue reference in message)"
+                )
+            else:
+                classification = "question"
+
         if classification == "sdlc" and project_working_dir != AI_REPO_ROOT:
             working_dir = AI_REPO_ROOT
             logger.info(
@@ -1041,8 +1348,6 @@ async def get_agent_response_sdk(
     enriched_message += f"\n\nFROM: {sender_name}"
     if chat_title:
         enriched_message += f" in {chat_title}"
-    if workflow_id:
-        enriched_message += f"\nWORKFLOW_ID: {workflow_id}"
     enriched_message += f"\nSESSION_ID: {session_id}"
     if task_list_id:
         enriched_message += f"\nTASK_SCOPE: {task_list_id}"
@@ -1052,7 +1357,21 @@ async def get_agent_response_sdk(
         "work initiated in this specific session. Do not include work, PRs, or "
         "requests from other sessions, other senders, or prior conversation threads."
     )
-    # For SDLC-routed requests, inject target repo context (never for PM mode)
+    # For SDLC-routed requests, inject target repo context (never for PM mode).
+    # ChatSession (session_type="chat") gets full pipeline instructions.
+    # All sessions are ChatSessions — orchestrate via dev-session subagent
+    _session_type = None
+    if session_id:
+        try:
+            from models.agent_session import AgentSession as _AgentSession
+
+            _sessions = list(_AgentSession.query.filter(session_id=session_id))
+            if _sessions:
+                _session_type = getattr(_sessions[0], "session_type", None)
+        except Exception:
+            pass
+
+    # Cross-repo SDLC: inject target repo context
     if project_mode != "pm" and classification == "sdlc" and project_working_dir != AI_REPO_ROOT:
         github_config = project.get("github", {}) if project else {}
         github_org = github_config.get("org", "")
@@ -1062,21 +1381,50 @@ async def get_agent_response_sdk(
         )
         if github_org and github_repo:
             enriched_message += f"\nGITHUB: {github_org}/{github_repo}"
-        enriched_message += "\nInvoke /sdlc immediately."
+
+    # ChatSession PM dispatch: always inject for chat sessions regardless of
+    # classification or repo. The PM persona has detailed instructions, but
+    # this reinforcement ensures the Agent tool is used instead of Skill tool.
+    if _session_type == "chat":
+        enriched_message += (
+            "\n\nYou are the PM. Orchestrate SDLC work stage-by-stage:\n"
+            "1. **Assess the current stage** — use read-only Bash commands "
+            "(gh issue view, gh pr view, gh pr list, grep) to determine "
+            "where work stands. You can run Bash for reads freely.\n"
+            "2. **Spawn one dev-session for the next stage** — use the Agent tool "
+            "to dispatch exactly one stage at a time:\n"
+            '   Agent(subagent_type="dev-session", description="<stage>: <short desc>", '
+            'prompt="Stage: <PLAN|BUILD|TEST|PATCH|REVIEW|DOCS>\\n'
+            "Issue: <URL>\\nPR: <URL if exists>\\n"
+            "Current state: <what's already done>\\n"
+            'Acceptance criteria: <what done looks like>")\n'
+            "3. **Verify the result** — check that the stage completed successfully "
+            "before progressing to the next one.\n"
+            "4. **Repeat** — assess, spawn, verify until the pipeline is complete "
+            "or you need human input.\n\n"
+            "For trivial or docs-only work, use your judgment on whether the full "
+            "pipeline is warranted.\n"
+            "Use the Agent tool for all coding work — slash commands like /do-build "
+            "and /do-test are the dev-session's internal tools."
+        )
     enriched_message += f"\nMESSAGE: {message}"
 
     # Log prompt summary before sending to agent
-    has_workflow = bool(workflow_id)
     has_worker_rules = project_mode != "pm"
     logger.info(
         f"[{request_id}] Sending to agent: {len(enriched_message)} chars, "
-        f"classification={classification}, has_workflow={has_workflow}, "
+        f"classification={classification}, "
         f"task_list={task_list_id or 'none'}, mode={project_mode}"
     )
     wr_label = "yes" if has_worker_rules else "no (pm mode)"
+    is_dm = chat_title is None
+    # ChatSession always uses PM persona; otherwise resolve from config
+    if _session_type == "chat":
+        persona = "project-manager"
+    else:
+        persona = _resolve_persona(project, chat_title, is_dm=is_dm)
     logger.info(
-        f"[{request_id}] Context: soul=yes, worker_rules={wr_label}, "
-        f"workflow_context={'yes' if has_workflow else 'no'}, "
+        f"[{request_id}] Context: persona={persona}, worker_rules={wr_label}, "
         f"session_id={session_id}"
     )
 
@@ -1086,20 +1434,60 @@ async def get_agent_response_sdk(
         # Extract message_id from the job context (passed through _execute_job)
         _message_id = None  # message_id not available at this layer
 
-        # PM mode: use PM system prompt (no WORKER_RULES, loads work-vault CLAUDE.md)
-        pm_system_prompt = None
-        if project_mode == "pm":
-            pm_system_prompt = load_pm_system_prompt(working_dir)
+        logger.info(f"[{request_id}] Resolved persona: {persona}")
+
+        # Build system prompt based on persona and project mode.
+        # ChatSession (session_type="chat") uses PM persona with read-only permissions.
+        custom_system_prompt = None
+        _permission_mode = "bypassPermissions"  # Default: full permissions
+
+        if _session_type == "chat":
+            # ChatSession: PM persona, full permissions but hook-restricted.
+            # Can write to docs/ and use gh CLI. Code writes blocked by pre_tool_use hook.
+            custom_system_prompt = load_pm_system_prompt(working_dir)
+            logger.info(f"[{request_id}] ChatSession mode: PM persona, bypassPermissions")
+        elif project_mode == "pm":
+            # PM mode: use PM system prompt (no WORKER_RULES, loads work-vault CLAUDE.md)
+            custom_system_prompt = load_pm_system_prompt(working_dir)
+        elif persona == "teammate":
+            # Teammate persona: casual mode, no WORKER_RULES
+            try:
+                custom_system_prompt = load_persona_prompt("teammate")
+            except FileNotFoundError:
+                logger.warning("Teammate persona not available, falling back to default")
+        # Developer persona uses default (load_system_prompt via ValorAgent.__init__)
+
+        # Determine gh_repo for cross-repo SDLC requests (issue #375).
+        # When classification is "sdlc" and the project targets a non-ai repo,
+        # set GH_REPO so all gh commands automatically target the correct repo.
+        _gh_repo = None
+        is_cross_repo_sdlc = (
+            project_mode != "pm"
+            and classification == "sdlc"
+            and project_working_dir != AI_REPO_ROOT
+        )
+        if is_cross_repo_sdlc:
+            _github_config = project.get("github", {}) if project else {}
+            _gh_org = _github_config.get("org", "")
+            _gh_name = _github_config.get("repo", "")
+            if _gh_org and _gh_name:
+                _gh_repo = f"{_gh_org}/{_gh_name}"
+
+        if _gh_repo:
+            logger.info(f"[{request_id}] Cross-repo: GH_REPO={_gh_repo}")
 
         agent = ValorAgent(
             working_dir=working_dir,
-            system_prompt=pm_system_prompt,
-            workflow_id=workflow_id,
+            system_prompt=custom_system_prompt,
+            permission_mode=_permission_mode,
             task_list_id=task_list_id,
             chat_id=chat_id,
             project_key=_project_key,
             message_id=_message_id,
             job_id=job_id,
+            gh_repo=_gh_repo,
+            target_repo=project_working_dir,
+            session_type=_session_type,
         )
         response = await agent.query(enriched_message, session_id=session_id)
 
@@ -1118,7 +1506,10 @@ async def get_agent_response_sdk(
         try:
             from bridge.session_transcript import complete_transcript
 
-            complete_transcript(session_id, status="failed")
+            # Capture exception details so the reflections system can produce
+            # actionable bug reports instead of "empty error summary" issues.
+            error_summary = f"{type(e).__name__}: {e}"[:500]
+            complete_transcript(session_id, status="failed", summary=error_summary)
         except Exception:
             pass  # Best-effort cleanup
         return (

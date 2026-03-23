@@ -85,12 +85,12 @@ No checkbox icons are used. The ISSUE stage label includes the issue number when
 - `bridge/summarizer.py`: `summarize_response()` (always-summarize entry point), `_strip_process_narration()` (pre-summarization cleanup), `_compose_structured_summary()` (template renderer), `_parse_summary_and_questions()` (question extractor), `_render_stage_progress()`, `_render_link_footer()`, `_linkify_references()` (auto-link PR/Issue refs)
 - `bridge/response.py`: Always calls summarizer for non-empty text, passes `AgentSession` via `session=` kwarg
 - `bridge/telegram_bridge.py`: `_send` callback accepts and forwards `session` parameter
-- `agent/job_queue.py`: `SendCallback` type includes session parameter, `send_to_chat()` passes `agent_session`
+- `agent/job_queue.py`: `SendCallback` type includes session parameter, `send_to_chat()` uses `classify_nudge_action()` for routing decisions and passes `agent_session`
 - `bridge/markdown.py`: `send_markdown()` with plain-text fallback
 
 ## Session Freshness
 
-Stage data (`[stage] BUILD completed`) and links (`issue_url`, `pr_url`) are written to Redis by `tools/session_progress.py` during agent execution. By the time the summarizer runs, the session object passed through the callback chain may be stale (loaded before stages were recorded).
+Stage data (via `stage_states` JSON field managed by `PipelineStateMachine` in `bridge/pipeline_state.py`) and links (`issue_url`, `pr_url`) are written to Redis during agent execution. By the time the summarizer runs, the session object passed through the callback chain may be stale (loaded before stages were recorded).
 
 Both `response.py` and `summarizer.py` re-read the session from Redis before composing structured output:
 
@@ -166,4 +166,4 @@ Basic `md` parse mode (not MarkdownV2). Supports bold, inline code, and `[text](
 
 - [AgentSession Model](agent-session-model.md) - Unified lifecycle model with stage progress helpers
 - [Bridge Response Improvements](bridge-response-improvements.md) - Response pipeline
-- [Coaching Loop](coaching-loop.md) - Output classification and auto-continue
+- [Bridge Workflow Gaps](bridge-workflow-gaps.md) - Output classification and auto-continue

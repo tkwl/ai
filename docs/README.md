@@ -34,13 +34,13 @@ tail -f logs/bridge.log
 
 | Document | Description |
 |----------|-------------|
-| [Telegram Integration](telegram.md) | Complete Telegram interface documentation |
+| [Telegram Integration](features/telegram.md) | Complete Telegram interface documentation |
 
 ### Operations
 
 | Document | Description |
 |----------|-------------|
-| [Deployment](deployment.md) | Multi-instance deployment configuration |
+| [Deployment](features/deployment.md) | Multi-instance deployment configuration |
 | [Reflections System](features/reflections.md) | Autonomous maintenance process |
 
 ### Features
@@ -100,7 +100,7 @@ PERPLEXITY_API_KEY=pplx-...
 
 The `.claude/` directory contains:
 - `agents/` - Subagent definitions that Claude Code can invoke
-- `commands/` - Slash commands for user-invokable skills
+- `commands/` - Slash commands (most migrated to `skills/`)
 - `settings.local.json` - Local configuration
 
 See [CLAUDE.md](/CLAUDE.md) for complete development guidelines.

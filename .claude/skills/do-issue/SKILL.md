@@ -22,12 +22,13 @@ This isn't optional politeness — it's functional. The `/do-plan` skill reads t
 
 | Sub-file | Load when... |
 |----------|-------------|
+| `RECON.md` | After Step 2, before writing — run the reconnaissance routine |
 | `ISSUE_TEMPLATE.md` | Writing the issue body (use as the structural skeleton) |
 | `CHECKLIST.md` | Before publishing — run every check, fix failures |
 
 ## Cross-Repo Resolution
 
-When invoked for a non-ai project, extract the `GITHUB:` line from the prompt context (e.g., `GITHUB: tomcounsell/popoto`). If present, use `--repo $GITHUB_REPO` with all `gh` commands below. If not present, omit `--repo` (defaults to cwd repo).
+For cross-project work, the `GH_REPO` environment variable is automatically set by `sdk_client.py`. The `gh` CLI natively respects this env var, so all `gh` commands automatically target the correct repository. No `--repo` flags or manual parsing needed.
 
 ## When to Use
 
@@ -49,17 +50,33 @@ Read the user's description. Identify:
 Before writing, gather context so the issue is grounded in reality:
 
 ```bash
-# Search for related closed issues (use --repo if GITHUB: context line is present)
-gh issue list --state closed --search "KEYWORDS" --limit 5 --json number,title,url $REPO_FLAG
+# Search for related closed issues
+gh issue list --state closed --search "KEYWORDS" --limit 5 --json number,title,url
 
 # Search for related merged PRs
-gh pr list --state merged --search "KEYWORDS" --limit 5 --json number,title,url $REPO_FLAG
+gh pr list --state merged --search "KEYWORDS" --limit 5 --json number,title,url
 
 # Check if relevant docs exist
 grep -rl "KEYWORD" docs/features/ docs/plans/ 2>/dev/null | head -5
 ```
 
-### Step 3: Write the Issue Body
+### Step 3: Reconnaissance (Explore → Concerns → Fan-out → Synthesize)
+
+Before writing, run the reconnaissance routine to surface unknowns and conflicts. Load `RECON.md` for the full pattern. Summary:
+
+1. **Broad scan** — Spawn an Explore agent (thoroughness: "very thorough") to map the affected area: relevant source files, existing tests, recent PRs, related docs.
+
+2. **Surface concerns** — From the scan results, identify what's unclear, conflicting, stale, already-done, or missing. List each as a discrete question.
+
+3. **Fan-out** — Spawn one Explore agent per concern, all in parallel. Each gets a focused research prompt: investigate one specific question, read the actual code, and return a recommendation.
+
+4. **Synthesize** — Reconcile all findings. Produce:
+   - What's confirmed (safe to include in the issue as-is)
+   - What needs fixing first (pre-requisites the issue should call out)
+   - What the issue should NOT include (already done, aspirational, or wrong assumptions)
+   - Revised scope (narrower or broader than the original request)
+
+This step catches stale assumptions, dead code, existing coverage, and architectural conflicts BEFORE they get baked into the issue. Skip only for trivially simple issues (typo fixes, config changes).
 
 Load `ISSUE_TEMPLATE.md` and fill it in. Key rules:
 
@@ -73,27 +90,22 @@ Load `ISSUE_TEMPLATE.md` and fill it in. Key rules:
 
 5. **Downstream context** — Explicitly state what happens next: "This issue will be consumed by `/do-plan` to produce a plan document at `docs/plans/{slug}.md`."
 
-### Step 4: Pre-Publish Checklist
+### Step 5: Pre-Publish Checklist
 
 Load `CHECKLIST.md` and verify every item before creating the issue.
 
-### Step 5: Create the Issue
+### Step 6: Create the Issue
 
 ```bash
-REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 TYPE="feature"  # or "bug" or "chore"
 
-# Use GITHUB_REPO from context if available, otherwise resolve from git
-REPO="${GITHUB_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
-
 gh issue create \
-  --repo "$REPO" \
   --title "Brief, specific title" \
   --label "$TYPE" \
   --body "$(cat /tmp/issue_body.md)"
 ```
 
-### Step 6: Report
+### Step 7: Report
 
 ```
 Issue created: #{number} — {title}

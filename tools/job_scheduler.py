@@ -24,6 +24,7 @@ import sys
 import time
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ MAX_SCHEDULING_DEPTH = 3
 # Default DM chat_id for headless jobs (Tom's DM)
 DEFAULT_DM_CHAT_ID = "179144806"
 DEFAULT_PROJECT_KEY = "valor"
-DEFAULT_WORKING_DIR = "/Users/valorengels/src/ai"
+DEFAULT_WORKING_DIR = str(Path(__file__).parent.parent)
 
 
 def _get_env_context() -> dict:
@@ -117,8 +118,51 @@ def _get_parent_session(parent_job_id: str):
         return None
 
 
+# --- Persona gate ---
+
+# Persona restrictions: which personas can perform which actions
+# teammate cannot schedule SDLC jobs; all other actions are unrestricted
+PERSONA_RESTRICTED_ACTIONS = {
+    "teammate": {"schedule"},
+}
+
+
+def _check_persona_permission(action_type: str) -> dict | None:
+    """Check if the current persona is allowed to perform the given action.
+
+    Reads persona from PERSONA env var (default: "developer" — permissive).
+
+    Args:
+        action_type: The action being attempted (e.g., "schedule").
+
+    Returns:
+        None if allowed, or a dict with error details if blocked.
+    """
+    persona = os.environ.get("PERSONA", "developer").lower()
+    restricted = PERSONA_RESTRICTED_ACTIONS.get(persona, set())
+
+    if action_type in restricted:
+        return {
+            "status": "error",
+            "message": (
+                f"Permission denied: the '{persona}' persona cannot perform "
+                f"'{action_type}' operations. SDLC scheduling is restricted to "
+                f"developer and project-manager personas."
+            ),
+            "persona": persona,
+            "action": action_type,
+        }
+    return None
+
+
 def cmd_schedule(args: argparse.Namespace) -> int:
     """Schedule an SDLC job for a GitHub issue."""
+    # Persona gate
+    perm = _check_persona_permission("schedule")
+    if perm:
+        _output(perm)
+        return 1
+
     from models.agent_session import AgentSession
 
     ctx = _get_env_context()
@@ -199,6 +243,9 @@ def cmd_schedule(args: argparse.Namespace) -> int:
     session_id = f"scheduled-{args.issue}-{uuid.uuid4().hex[:8]}"
     priority = args.priority or "normal"
 
+    # Session type: explicit flag > default (chat for issue-based work)
+    session_type = getattr(args, "session_type", None) or "chat"
+
     # Parent job inheritance
     parent_job_id = getattr(args, "parent_job", None)
     parent_session = None
@@ -257,6 +304,7 @@ def cmd_schedule(args: argparse.Namespace) -> int:
             chat_id=inherited_chat_id,
             message_id=int(ctx["message_id"]) if ctx["message_id"] else 0,
             classification_type=inherited_classification_type,
+            session_type=session_type,
             scheduled_after=scheduled_after,
             scheduling_depth=depth + 1,
             issue_url=issue_url,
@@ -650,6 +698,12 @@ def main():
     sched.add_argument("--priority", choices=["urgent", "high", "normal", "low"], default="normal")
     sched.add_argument("--project", help="Project key (default: from env or 'valor')")
     sched.add_argument("--after", help="Defer execution until this ISO 8601 datetime")
+    sched.add_argument(
+        "--session-type",
+        choices=["chat", "dev"],
+        help="Session type: chat (PM orchestrates) or dev (direct execution). "
+        "Default: chat for issue/PR work, dev for hotfixes.",
+    )
     sched.add_argument(
         "--parent-job",
         help="Parent job ID — creates this as a child job inheriting parent fields",

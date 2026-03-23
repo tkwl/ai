@@ -5,7 +5,7 @@ Backfills the new model relationship fields introduced by the popoto model
 relationships refactor (issue #295):
 
 1. Populates project_key on TelegramMessage, Link, DeadLetter, Chat,
-   ReflectionRun by deriving it from chat_id using config/projects.json.
+   ReflectionRun by deriving it from chat_id using ~/Desktop/Valor/projects.json.
 2. Copies media/URL/classification fields from AgentSession to the
    corresponding TelegramMessage (matched by chat_id + message_id).
 3. Sets trigger_message_id on AgentSession and agent_session_id on
@@ -29,6 +29,7 @@ from pathlib import Path
 
 # Add project root to path
 PROJECT_DIR = Path(__file__).parent.parent
+DESKTOP_VALOR_DIR = Path.home() / "Desktop" / "Valor"
 sys.path.insert(0, str(PROJECT_DIR))
 
 logging.basicConfig(
@@ -39,8 +40,11 @@ logger = logging.getLogger(__name__)
 
 
 def load_chat_to_project_map() -> dict[str, str]:
-    """Build a chat_id -> project_key mapping from config/projects.json."""
+    """Build a chat_id -> project_key mapping from projects.json."""
+    # Check PROJECT_DIR first (allows test overrides), then Desktop/Valor
     config_path = PROJECT_DIR / "config" / "projects.json"
+    if not config_path.exists():
+        config_path = DESKTOP_VALOR_DIR / "projects.json"
     if not config_path.exists():
         logger.warning(f"Projects config not found at {config_path}")
         return {}
@@ -214,7 +218,10 @@ def main():
     parser = argparse.ArgumentParser(description="Backfill model relationship fields")
     parser.add_argument("--dry-run", action="store_true", help="Preview changes without writing")
     parser.add_argument(
-        "--max-age", type=int, default=90, help="Only process records from last N days (default: 90)"
+        "--max-age",
+        type=int,
+        default=90,
+        help="Only process records from last N days (default: 90)",
     )
     args = parser.parse_args()
 

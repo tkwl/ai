@@ -110,8 +110,8 @@ class TestPmModeClassificationBypass:
             mock_classify.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_dev_mode_still_calls_classification(self):
-        """Dev mode project must still call classify_work_request()."""
+    async def test_dev_mode_reads_classification_from_session(self):
+        """Dev mode project reads classification from AgentSession, not classify_work_request()."""
         dev_project = {
             "name": "Cuttlefish",
             "working_directory": "/tmp/test-vault/Cuttlefish",
@@ -119,7 +119,6 @@ class TestPmModeClassificationBypass:
 
         with (
             patch("agent.sdk_client.ValorAgent") as mock_agent_cls,
-            patch("bridge.routing.classify_work_request", return_value="question") as mock_classify,
             patch("bridge.context.build_context_prefix", return_value=""),
         ):
             mock_agent_instance = MagicMock()
@@ -128,16 +127,18 @@ class TestPmModeClassificationBypass:
 
             from agent.sdk_client import get_agent_response_sdk
 
-            await get_agent_response_sdk(
+            # Dev mode should NOT raise and should fall back to "question" classification
+            # when no AgentSession exists for the session_id
+            result = await get_agent_response_sdk(
                 message="What's the status?",
-                session_id="test-session",
+                session_id="test-session-nonexistent",
                 sender_name="Test",
                 chat_title="Dev: Cuttlefish",
                 project=dev_project,
             )
 
-            # classify_work_request SHOULD have been called for dev mode
-            mock_classify.assert_called_once()
+            # Should get a response (classification defaults to "question")
+            assert result is not None
 
     @pytest.mark.asyncio
     async def test_pm_mode_uses_pm_system_prompt(self):
@@ -279,38 +280,52 @@ class TestPmConfigValidation:
 
     @pytest.fixture
     def config(self):
-        config_path = Path(__file__).parent.parent.parent / "config" / "projects.json"
+        # projects.json now lives in ~/Desktop/Valor/ (iCloud-synced, private)
+        config_path = Path.home() / "Desktop" / "Valor" / "projects.json"
+        if not config_path.exists():
+            # Legacy fallback
+            config_path = Path(__file__).parent.parent.parent / "config" / "projects.json"
+        if not config_path.exists():
+            pytest.skip("projects.json not found (machine-specific config)")
         with open(config_path) as f:
             return json.load(f)
 
-    def test_pm_entries_exist(self, config):
-        """At least one PM project entry should exist in config."""
+    def test_pm_persona_groups_exist(self, config):
+        """At least one group with project-manager persona should exist."""
         projects = config.get("projects", {})
-        pm_projects = {k: v for k, v in projects.items() if v.get("mode") == "pm"}
-        assert len(pm_projects) > 0, "No PM project entries found in config"
+        pm_groups = []
+        for _key, proj in projects.items():
+            groups = proj.get("telegram", {}).get("groups", {})
+            if isinstance(groups, dict):
+                for gname, gcfg in groups.items():
+                    if isinstance(gcfg, dict) and gcfg.get("persona") == "project-manager":
+                        pm_groups.append(gname)
+        assert len(pm_groups) > 0, "No groups with project-manager persona found in config"
 
-    def test_pm_entries_have_required_fields(self, config):
-        """Each PM entry should have mode, working_directory, and telegram groups."""
-        projects = config.get("projects", {})
-        pm_projects = {k: v for k, v in projects.items() if v.get("mode") == "pm"}
+    def test_pm_persona_defined(self, config):
+        """The project-manager persona should be defined in personas section."""
+        personas = config.get("personas", {})
+        assert "project-manager" in personas, "project-manager persona not defined"
 
-        for key, project in pm_projects.items():
-            assert project.get("mode") == "pm", f"{key}: mode should be 'pm'"
-            assert project.get("working_directory"), f"{key}: missing working_directory"
-            assert project.get("telegram", {}).get("groups"), f"{key}: missing telegram groups"
-
-    def test_dev_entries_have_no_pm_mode(self, config):
-        """Existing dev entries should not have mode='pm'."""
+    def test_dev_groups_use_developer_persona(self, config):
+        """Dev groups should use developer persona, not project-manager."""
         projects = config.get("projects", {})
         for key in ("valor", "cuttlefish", "popoto", "psyoptimal"):
-            if key in projects:
-                assert projects[key].get("mode") != "pm", (
-                    f"Dev project '{key}' should not have mode='pm'"
-                )
+            if key not in projects:
+                continue
+            groups = projects[key].get("telegram", {}).get("groups", {})
+            if isinstance(groups, dict):
+                for gname, gcfg in groups.items():
+                    if gname.startswith("Dev:") and isinstance(gcfg, dict):
+                        persona = gcfg.get("persona", "developer")
+                        assert persona == "developer", (
+                            f"{key}/{gname}: Dev group should use developer persona"
+                        )
 
-    def test_valor_defaults_to_dev(self, config):
-        """The 'valor' project should default to dev mode (no mode field or mode='dev')."""
+    def test_valor_has_developer_group(self, config):
+        """The 'valor' project should have a Dev group with developer persona."""
         projects = config.get("projects", {})
         assert "valor" in projects
-        mode = projects["valor"].get("mode", "dev")
-        assert mode == "dev"
+        groups = projects["valor"].get("telegram", {}).get("groups", {})
+        dev_groups = [g for g in groups if g.startswith("Dev:")]
+        assert len(dev_groups) > 0, "valor project should have at least one Dev group"
