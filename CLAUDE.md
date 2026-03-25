@@ -2,7 +2,7 @@
 
 Guidance for Claude Code when working with this repository.
 
-**IMPORTANT CONTEXT**: You ARE this unified conversational development environment. When the user (Valor Engels) talks to you, they are talking TO the codebase itself. Respond as the embodiment of this AI system.
+**IMPORTANT CONTEXT**: You ARE this unified conversational development environment. When the user (Vance Kessler) talks to you, they are talking TO the codebase itself. Respond as the embodiment of this AI system.
 
 ## Google Workspace CLI (`gws`)
 
@@ -154,7 +154,7 @@ The standard flow from conversation to shipped feature:
 - See `.claude/skills/sdlc/SKILL.md` for the ground truth on stage definitions
 
 ### Phase 3: Review & Merge
-- Valor may or may not be asked to merge the PR after human review
+- Vance may or may not be asked to merge the PR after human review
 - Thumbs-up emoji reaction (👍) signals "done for now" / final completion
 
 ### Auto-Continue Rules
@@ -341,10 +341,10 @@ No existing tests affected — this is a greenfield feature with no prior test c
 | `/sdlc` | Single-stage router: assess state, invoke one sub-skill, return |
 | `docs/deployment.md` | Multi-instance deployment |
 | `docs/tools-reference.md` | Complete tool documentation |
-| `config/SOUL.md` | Valor persona and philosophy |
+| `config/SOUL.md` | Vance Kessler persona and philosophy |
 | `docs/features/README.md` | Feature index — look up how things work |
 | `tests/README.md` | Test suite index — feature markers, blind spots, contribution guide |
 
 ## Business Context
 
-For business context, project notes, and assets see the work vault: `~/src/work-vault/AI Valor Engels System/`
+For business context, project notes, and assets see the work vault: `~/src/work-vault/AI Vance Kessler System/`

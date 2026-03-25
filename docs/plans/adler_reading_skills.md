@@ -2,7 +2,7 @@
 status: Planning
 type: feature
 appetite: Medium
-owner: Valor Engels
+owner: Vance Kessler
 created: 2026-02-15
 tracking: https://github.com/tomcounsell/ai/issues/113
 ---

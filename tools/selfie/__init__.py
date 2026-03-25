@@ -1,8 +1,8 @@
 """
 Selfie Tool
 
-Generate AI selfies of Valor Engels using OpenAI's gpt-image-1 model.
-Valor's appearance is defined canonically from his profile photo.
+Generate AI selfies of Vance Kessler using OpenAI's gpt-image-1 model.
+Vance's appearance is defined canonically from his profile photo.
 """
 
 import base64
@@ -16,15 +16,15 @@ from openai import OpenAI
 load_dotenv()
 load_dotenv(Path.home() / "Desktop" / "Valor" / ".env")
 
-# Canonical appearance description derived from Valor's profile photo
-VALOR_APPEARANCE = (
+# Canonical appearance description derived from Vance's profile photo
+VANCE_APPEARANCE = (
     "slim white male in his mid-30s, short brown hair slightly longer on top, "
     "short brown stubble, blue-grey eyes, lean build, casual but professional style"
 )
 
 # Base selfie prompt — context/scene gets appended
 SELFIE_BASE_PROMPT = (
-    f"Photorealistic selfie photo of {VALOR_APPEARANCE}. "
+    f"Photorealistic selfie photo of {VANCE_APPEARANCE}. "
     "Shot from a slight below-eye-level angle as if holding a phone, "
     "natural lighting, sharp focus on face, shallow depth of field background. "
     "Candid, authentic feel — not posed or stock-photo stiff."
@@ -46,7 +46,7 @@ def take_selfie(
     size: str = "1024x1024",
 ) -> dict:
     """
-    Generate a selfie of Valor Engels.
+    Generate a selfie of Vance Kessler.
 
     Args:
         scene: Named scene preset ('office', 'coffee', 'outdoors', 'evening', 'working').
@@ -131,7 +131,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Generate a selfie of Valor Engels using OpenAI gpt-image-1."
+        description="Generate a selfie of Vance Kessler using OpenAI gpt-image-1."
     )
     parser.add_argument(
         "scene",

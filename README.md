@@ -1,10 +1,10 @@
-# Valor AI System
+# Vance Kessler AI System
 
-An AI coworker powered by the Claude Agent SDK that runs autonomously on its own Mac.
+An AI coworker powered by the Claude Agent SDK that runs autonomously on its own machine.
 
 ## What Is This?
 
-Valor is an AI coworker - not an assistant, not a tool, but a colleague with its own Mac, its own work, and its own agency. The supervisor assigns work and provides direction. Valor executes autonomously, reaching out via Telegram when necessary.
+Vance Kessler is an AI coworker at Express AI - not an assistant, not a tool, but a colleague with its own machine, its own work, and its own agency. The supervisor (James) assigns work and provides direction. Vance executes autonomously, reaching out via Telegram when necessary.
 
 ## Current Status
 
@@ -77,7 +77,7 @@ The system uses the Claude Agent SDK as its agent backend, providing the same ca
 |------|---------|
 | `agent/sdk_client.py` | Claude Agent SDK wrapper |
 | `bridge/telegram_bridge.py` | Telegram ↔ Agent bridge |
-| `config/SOUL.md` | Valor persona definition |
+| `config/SOUL.md` | Vance Kessler persona definition |
 | `.env` | Environment variables and API keys |
 
 ## Service Management
@@ -102,7 +102,7 @@ ai/
 │   ├── telegram_history/   # Chat history storage
 │   └── link_analysis/      # URL analysis
 ├── config/
-│   ├── SOUL.md             # Valor persona definition
+│   ├── SOUL.md             # Vance Kessler persona definition
 │   └── projects.json       # Multi-project configuration
 ├── scripts/
 │   ├── valor-service.sh    # Service management
@@ -136,7 +136,7 @@ Skills are available via MCP servers registered in `.mcp.json`:
 
 ## Reflections (Daily Maintenance)
 
-Valor runs autonomous maintenance daily at 6 AM Pacific:
+Vance runs autonomous maintenance daily at 6 AM Pacific:
 
 1. **clean_legacy** - Remove deprecated patterns
 2. **review_logs** - Analyze yesterday's logs
@@ -161,4 +161,4 @@ black . && ruff check . && mypy . --strict
 
 ## Contact
 
-Valor Engels
+Vance Kessler / Express AI

@@ -1,6 +1,6 @@
 # Telegram Integration
 
-Telegram is the primary (but not only) interface for the Valor AI System. This integration is strictly an **interface layer** - it handles input, displays running status, delivers responses, and provides debug commands. It is mutually exclusive from the core AI system.
+Telegram is the primary (but not only) interface for the Vance Kessler AI System. This integration is strictly an **interface layer** - it handles input, displays running status, delivers responses, and provides debug commands. It is mutually exclusive from the core AI system.
 
 ## Architecture
 
@@ -32,7 +32,7 @@ This system uses a **real Telegram user account** via Telethon, not a bot.
 | Aspect | Bot | Real User (Our Approach) |
 |--------|-----|--------------------------|
 | Authentication | Bot token | Phone + 2FA |
-| Appearance | Bot badge | Regular user "Valor Engels" |
+| Appearance | Bot badge | Regular user "Vance Kessler" |
 | Capabilities | Limited | Full client features |
 | Message access | Only when addressed | Full history access |
 | Presence | Always "bot" | Natural user presence |

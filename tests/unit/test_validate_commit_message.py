@@ -166,7 +166,7 @@ class TestValidCommitsAllowed:
 
     def test_allows_commit_with_author_flag(self):
         """--author flag is different from co-author trailer, should be allowed."""
-        cmd = 'git commit --author="Valor Engels <valor@example.com>" -m "fix: thing"'
+        cmd = 'git commit --author="Vance Kessler <vance@example.com>" -m "fix: thing"'
         inp = {"tool_name": "Bash", "tool_input": {"command": cmd}}
         code, out, _ = run_hook(inp)
         assert code == 0

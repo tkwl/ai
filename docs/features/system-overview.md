@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document provides a comprehensive architectural overview of the unified conversational development environment. The system seamlessly integrates natural conversation with code execution capabilities through Claude Code, embodying a production-ready AI platform with the Valor Engels persona.
+This document provides a comprehensive architectural overview of the unified conversational development environment. The system seamlessly integrates natural conversation with code execution capabilities through Claude Code, embodying a production-ready AI platform with the Vance Kessler persona.
 
 ## High-Level Architecture
 
@@ -71,7 +71,7 @@ The Claude Agent SDK is the agent backend.
                   └─────────┬─────────┘
                             ▼
                      ┌─────────────┐
-                     │Valor Agent  │
+                     │Vance Agent  │
                      └──────┬──────┘
                             ▼
          ┌──────────────────┼──────────────────┐
@@ -88,7 +88,7 @@ The system employs a **specialized subagent pattern** to prevent context polluti
 ```
 User Query
     ↓
-Main Agent (Valor) - Clean Context (<10k tokens)
+Main Agent (Vance) - Clean Context (<10k tokens)
     ↓
 Routing Layer
     ├── Task Analyzer
