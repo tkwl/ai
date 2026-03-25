@@ -163,7 +163,7 @@ class TestTranscribeVoiceIntegration:
         """Transcription returns None when no API key is set."""
         from bridge.media import transcribe_voice
 
-        with patch.dict("os.environ", {"OPENAI_API_KEY": ""}):
+        with patch.dict("os.environ", {"GROQ_API_KEY": ""}):
             # Reload to pick up env change
             result = await transcribe_voice(Path("/tmp/fake.ogg"))
             assert result is None

@@ -293,24 +293,24 @@ async def download_media(client: TelegramClient, message, prefix: str = "media")
 
 async def transcribe_voice(filepath: Path) -> str | None:
     """
-    Transcribe voice/audio file using OpenAI Whisper API.
+    Transcribe voice/audio file using Groq Whisper API.
 
     Returns transcription text, or None if transcription failed.
     """
-    api_key = os.getenv("OPENAI_API_KEY", "")
+    api_key = os.getenv("GROQ_API_KEY", "")
     if not api_key:
-        logger.warning("No OPENAI_API_KEY for voice transcription")
+        logger.warning("No GROQ_API_KEY for voice transcription")
         return None
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             with open(filepath, "rb") as f:
                 files = {"file": (filepath.name, f, "audio/ogg")}
-                data = {"model": "whisper-1"}
+                data = {"model": "whisper-large-v3-turbo"}
                 headers = {"Authorization": f"Bearer {api_key}"}
 
                 response = await client.post(
-                    "https://api.openai.com/v1/audio/transcriptions",
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
                     files=files,
                     data=data,
                     headers=headers,
@@ -320,7 +320,9 @@ async def transcribe_voice(filepath: Path) -> str | None:
                     result = response.json()
                     return result.get("text", "").strip()
                 else:
-                    logger.error(f"Whisper API error: {response.status_code} - {response.text}")
+                    logger.error(
+                        f"Groq Whisper API error: {response.status_code} - {response.text}"
+                    )
                     return None
 
     except Exception as e:
